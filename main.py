@@ -113,16 +113,24 @@ class SatelliteDatasetPreparer:
 class SatelliteDataset(Dataset):
     """PyTorch Dataset for satellite image pairs"""
 
-    def __init__(self, clean_dir, cloudy_dir, transform=None):
+    def __init__(self, clean_dir, cloudy_dir, transform=None, preload=True, cache_size=50):
         self.clean_dir = Path(clean_dir)
         self.cloudy_dir = Path(cloudy_dir)
         self.files = sorted(list(self.clean_dir.glob('*.npy')))
         self.transform = transform
+        self.preload = preload
+        self.cache = {}
+        self.cache_size = cache_size
 
-    def __len__(self):
-        return len(self.files)
+        # Preload all data to RAM if dataset is small (CPU bottleneck fix #1)
+        if preload and len(self.files) <= cache_size:
+            print(f"Preloading {len(self.files)} images to RAM...")
+            for idx in range(len(self.files)):
+                self.cache[idx] = self._load_from_disk(idx)
+            print("Preloading complete!")
 
-    def __getitem__(self, idx):
+    def _load_from_disk(self, idx):
+        """Load image pair from disk"""
         clean_path = self.files[idx]
         cloudy_path = self.cloudy_dir / clean_path.name
 
@@ -134,6 +142,23 @@ class SatelliteDataset(Dataset):
             cloudy = self.transform(cloudy)
 
         return cloudy, clean
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        # Use cached data if available (CPU bottleneck fix #2)
+        if idx in self.cache:
+            return self.cache[idx]
+
+        # Load from disk
+        data = self._load_from_disk(idx)
+
+        # Cache if within cache size
+        if len(self.cache) < self.cache_size:
+            self.cache[idx] = data
+
+        return data
 
 
 # ==================== 2. DATA EXPLORATION & INSIGHTS ====================
@@ -425,7 +450,6 @@ class Discriminator(nn.Module):
             nn.LeakyReLU(0.2),
 
             nn.Conv2d(512, 1, 4, padding=1),
-            nn.Sigmoid()
         )
 
     def forward(self, x, y):
@@ -735,7 +759,7 @@ class DiffusionTrainer:
 class EarlyStopping:
     """Early stopping to prevent overfitting"""
 
-    def __init__(self, patience=7, min_delta=0.0, verbose=True):
+    def __init__(self, patience=3, min_delta=0.0, verbose=True):
         """
         Args:
             patience: Number of epochs to wait for improvement
@@ -787,26 +811,43 @@ class ModelTrainer:
         self.device = device
         self.models = []
         self.histories = []
+        self.training_time = 0  # Track total training time
 
         print(f"Using device: {self.device}")
         if self.device == 'cuda':
             print(f"GPU: {torch.cuda.get_device_name(0)}")
             print(f"Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
 
+            # Enable optimizations (CPU bottleneck fix #3)
+            torch.backends.cudnn.benchmark = True  # Auto-tune convolution algorithms
+            torch.backends.cuda.matmul.allow_tf32 = True  # Use TF32 for faster matmul
+            torch.backends.cudnn.allow_tf32 = True
+
     def train_kfold(self, dataset, k=5, epochs=20, batch_size=8, lr=0.001,
-                    patience=7, use_amp=False):
+                    patience=7, use_amp=False, num_workers=4, persistent_workers=True,
+                    prefetch_factor=3):
         """
         Train model with K-fold cross-validation
 
+        DIFFERENCE: train_kfold() splits data into K folds and trains K separate models.
+                   Each fold uses different train/val split for robust evaluation.
+                   _train_fold() is the internal method that trains a single model.
+
         Args:
             dataset: PyTorch Dataset
-            k: Number of folds
-            epochs: Training epochs
+            k: Number of folds (K models will be trained)
+            epochs: Training epochs per fold
             batch_size: Batch size
             lr: Learning rate
             patience: Early stopping patience
-            use_amp: Use Automatic Mixed Precision (recommended for GTX 1050)
+            use_amp: Use Automatic Mixed Precision
+            num_workers: Data loading workers (CPU bottleneck fix #4)
+            persistent_workers: Keep workers alive between epochs (CPU bottleneck fix #5)
+            prefetch_factor: Batches to prefetch per worker (CPU bottleneck fix #6)
         """
+        import time
+        start_time = time.time()
+
         print(f"\n{'='*60}")
         print(f"Training {self.model_type} with {k}-Fold CV")
         print(f"{'='*60}")
@@ -818,14 +859,29 @@ class ModelTrainer:
             print(f"\nFold {fold + 1}/{k}")
             print("-" * 40)
 
-            # Create data loaders
+            # Create data loaders with optimizations (CPU bottleneck fix #7)
             train_subset = torch.utils.data.Subset(dataset, train_idx)
             val_subset = torch.utils.data.Subset(dataset, val_idx)
 
-            train_loader = DataLoader(train_subset, batch_size=batch_size,
-                                     shuffle=True, num_workers=2, pin_memory=True)
-            val_loader = DataLoader(val_subset, batch_size=batch_size,
-                                   num_workers=2, pin_memory=True)
+            train_loader = DataLoader(
+                train_subset,
+                batch_size=batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=True,
+                persistent_workers=persistent_workers if num_workers > 0 else False,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                drop_last=True  # Avoid small last batch
+            )
+
+            val_loader = DataLoader(
+                val_subset,
+                batch_size=batch_size,
+                num_workers=num_workers // 2,  # Fewer workers for validation
+                pin_memory=True,
+                persistent_workers=persistent_workers if num_workers > 0 else False,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None
+            )
 
             # Initialize model
             if self.model_type == 'UNet':
@@ -847,18 +903,34 @@ class ModelTrainer:
             else:
                 raise ValueError(f"Unknown model type: {self.model_type}")
 
-            # Train
+            # Train single fold
             history = self._train_fold(model, train_loader, val_loader, epochs, lr,
                                       patience, use_amp)
 
             self.models.append(model)
             self.histories.append(history)
 
+        # Record total training time
+        self.training_time = time.time() - start_time
+        print(f"\n{'='*60}")
+        print(f"Total training time: {self.training_time/60:.2f} minutes")
+        print(f"Average time per fold: {self.training_time/k/60:.2f} minutes")
+        print(f"{'='*60}")
+
         return self.models, self.histories
 
     def _train_fold(self, model, train_loader, val_loader, epochs, lr,
                    patience, use_amp):
-        """Train single fold with early stopping"""
+        """
+        Train single fold with early stopping
+
+        DIFFERENCE: This is an internal method called by train_kfold().
+                   It trains ONE model on ONE specific train/val split.
+                   train_kfold() calls this K times with different splits.
+        """
+        import time
+        fold_start = time.time()
+
         criterion = nn.MSELoss()
         optimizer = optim.Adam(model.parameters(), lr=lr)
         early_stopping = EarlyStopping(patience=patience, verbose=True)
@@ -866,20 +938,22 @@ class ModelTrainer:
         # Mixed precision training (saves memory for GTX 1050)
         scaler = torch.cuda.amp.GradScaler() if use_amp and self.device == 'cuda' else None
 
-        history = {'train_loss': [], 'val_loss': []}
+        history = {'train_loss': [], 'val_loss': [], 'epoch_times': []}
 
         for epoch in range(epochs):
+            epoch_start = time.time()
+
             # Training
             model.train()
             train_loss = 0
             for cloudy, clean in train_loader:
-                cloudy, clean = cloudy.to(self.device), clean.to(self.device)
+                cloudy, clean = cloudy.to(self.device, non_blocking=True), clean.to(self.device, non_blocking=True)
 
                 # Handle LSTM input
                 if self.model_type == 'LSTM':
                     cloudy = cloudy.unsqueeze(1)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)  # CPU bottleneck fix #8
 
                 # Mixed precision forward pass
                 if use_amp and scaler is not None:
@@ -902,7 +976,7 @@ class ModelTrainer:
             val_loss = 0
             with torch.no_grad():
                 for cloudy, clean in val_loader:
-                    cloudy, clean = cloudy.to(self.device), clean.to(self.device)
+                    cloudy, clean = cloudy.to(self.device, non_blocking=True), clean.to(self.device, non_blocking=True)
 
                     if self.model_type == 'LSTM':
                         cloudy = cloudy.unsqueeze(1)
@@ -919,11 +993,13 @@ class ModelTrainer:
 
             train_loss /= len(train_loader)
             val_loss /= len(val_loader)
+            epoch_time = time.time() - epoch_start
 
             history['train_loss'].append(train_loss)
             history['val_loss'].append(val_loss)
+            history['epoch_times'].append(epoch_time)
 
-            print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+            print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, Time: {epoch_time:.2f}s")
 
             # Early stopping check
             if early_stopping(val_loss, model):
@@ -932,6 +1008,8 @@ class ModelTrainer:
 
         # Load best model
         early_stopping.load_best_model(model)
+        fold_time = time.time() - fold_start
+        print(f"Fold training time: {fold_time/60:.2f} minutes")
         print(f"Loaded best model with val_loss: {early_stopping.best_loss:.6f}")
 
         return history
@@ -941,7 +1019,7 @@ class ModelTrainer:
         generator = Generator().to(self.device)
         discriminator = Discriminator().to(self.device)
 
-        criterion_gan = nn.BCELoss()
+        criterion_gan = nn.BCEWithLogitsLoss()
         criterion_l1 = nn.L1Loss()
 
         optimizer_g = optim.Adam(generator.parameters(), lr=lr, betas=(0.5, 0.999))
@@ -1080,22 +1158,36 @@ class ModelEvaluator:
     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.device = device
         self.results = {}
+        self.timing_results = {}  # Store timing information
 
     def evaluate_model(self, model, test_loader, model_name):
         """Evaluate single model"""
+        import time
+
         model.eval()
 
         all_preds = []
         all_targets = []
+        inference_times = []
 
         with torch.no_grad():
             for cloudy, clean in test_loader:
-                cloudy = cloudy.to(self.device)
+                cloudy = cloudy.to(self.device, non_blocking=True)
 
                 if 'LSTM' in model_name:
                     cloudy = cloudy.unsqueeze(1)
 
+                # Measure inference time
+                if self.device == 'cuda':
+                    torch.cuda.synchronize()
+                start_time = time.time()
+
                 output = model(cloudy)
+
+                if self.device == 'cuda':
+                    torch.cuda.synchronize()
+                inference_time = time.time() - start_time
+                inference_times.append(inference_time)
 
                 all_preds.append(output.cpu().numpy())
                 all_targets.append(clean.numpy())
@@ -1119,12 +1211,19 @@ class ModelEvaluator:
         # SSIM (simplified version)
         ssim = self._calculate_ssim(targets, preds)
 
+        # Timing statistics
+        avg_inference_time = np.mean(inference_times)
+        total_inference_time = np.sum(inference_times)
+        images_per_second = len(preds) / total_inference_time
+
         metrics = {
             'MSE': mse,
             'MAE': mae,
             'RMSE': rmse,
             'PSNR': psnr,
-            'SSIM': ssim
+            'SSIM': ssim,
+            'Avg_Inference_Time': avg_inference_time,
+            'Images_Per_Second': images_per_second
         }
 
         self.results[model_name] = metrics
@@ -1132,7 +1231,10 @@ class ModelEvaluator:
         print(f"\n{model_name} Results:")
         print("-" * 40)
         for metric, value in metrics.items():
-            print(f"{metric}: {value:.6f}")
+            if 'Time' in metric or 'Second' in metric:
+                print(f"{metric}: {value:.4f}")
+            else:
+                print(f"{metric}: {value:.6f}")
 
         return metrics
 
@@ -1160,30 +1262,42 @@ class ModelEvaluator:
 
         return ssim
 
-    def compare_models(self):
-        """Generate comparison visualizations"""
+    def compare_models(self, training_times=None):
+        """Generate comparison visualizations including training time"""
         if not self.results:
             print("No results to compare")
             return
 
         df = pd.DataFrame(self.results).T
 
+        # Add training times if provided
+        if training_times:
+            df['Training_Time_Minutes'] = [training_times.get(model, 0) / 60
+                                           for model in df.index]
+
         print("\n" + "="*60)
         print("MODEL COMPARISON SUMMARY")
         print("="*60)
         print(df.to_string())
 
-        # Plot comparison
-        fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-        axes = axes.flatten()
+        # Plot comparison with training time
+        n_metrics = len(df.columns)
+        n_cols = 3
+        n_rows = (n_metrics + n_cols - 1) // n_cols
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5*n_rows))
+        axes = axes.flatten() if n_rows > 1 else [axes] if n_cols == 1 else axes
 
         metrics = list(df.columns)
+        colors = ['skyblue', 'lightcoral', 'lightgreen', 'lightyellow', 'lightpink']
+
         for i, metric in enumerate(metrics):
             if i < len(axes):
-                df[metric].plot(kind='bar', ax=axes[i], color='skyblue')
-                axes[i].set_title(f'{metric} Comparison')
+                df[metric].plot(kind='bar', ax=axes[i], color=colors[:len(df)])
+                axes[i].set_title(f'{metric} Comparison', fontsize=12, fontweight='bold')
                 axes[i].set_ylabel(metric)
                 axes[i].tick_params(axis='x', rotation=45)
+                axes[i].grid(axis='y', alpha=0.3)
 
         # Hide unused subplots
         for i in range(len(metrics), len(axes)):
@@ -1193,11 +1307,48 @@ class ModelEvaluator:
         plt.savefig('model_comparison.png', dpi=300, bbox_inches='tight')
         plt.close()
 
+        # Create training time vs quality plot
+        if training_times:
+            fig, ax = plt.subplots(figsize=(10, 6))
+
+            train_times = [training_times.get(model, 0) / 60 for model in df.index]
+            psnr_values = df['PSNR'].values
+
+            ax.scatter(train_times, psnr_values, s=200, alpha=0.6, c=range(len(df)), cmap='viridis')
+
+            for i, model in enumerate(df.index):
+                ax.annotate(model, (train_times[i], psnr_values[i]),
+                           xytext=(5, 5), textcoords='offset points',
+                           fontsize=10, fontweight='bold')
+
+            ax.set_xlabel('Training Time (minutes)', fontsize=12, fontweight='bold')
+            ax.set_ylabel('PSNR (dB)', fontsize=12, fontweight='bold')
+            ax.set_title('Training Time vs Quality', fontsize=14, fontweight='bold')
+            ax.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.savefig('time_vs_quality.png', dpi=300, bbox_inches='tight')
+            plt.close()
+
+            print("\nTime vs Quality plot saved to: time_vs_quality.png")
+
         print("\nComparison saved to: model_comparison.png")
 
-        # Best model
-        best_model = df['PSNR'].idxmax()
-        print(f"\nBest model (by PSNR): {best_model}")
+        # Best model analysis
+        best_psnr_model = df['PSNR'].idxmax()
+        best_speed_model = df['Images_Per_Second'].idxmax()
+
+        print(f"\n{'='*60}")
+        print("BEST MODEL ANALYSIS")
+        print(f"{'='*60}")
+        print(f"Best Quality (PSNR): {best_psnr_model} ({df.loc[best_psnr_model, 'PSNR']:.2f} dB)")
+        print(f"Fastest Inference: {best_speed_model} ({df.loc[best_speed_model, 'Images_Per_Second']:.2f} img/s)")
+
+        if training_times:
+            fastest_training = df['Training_Time_Minutes'].idxmin()
+            print(f"Fastest Training: {fastest_training} ({df.loc[fastest_training, 'Training_Time_Minutes']:.2f} min)")
+
+        print(f"{'='*60}")
 
         return df
 
@@ -1235,8 +1386,10 @@ def main():
     # 4. Train Models with K-Fold
     print("\n### STEP 3: Model Training with K-Fold CV ###")
 
-    model_types = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']
+    #model_types = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']
+    model_types = ['GAN']
     trained_models = {}
+    training_times = {}  # Track training time for each model
 
     for model_type in model_types:
         trainer = ModelTrainer(model_type)
@@ -1244,12 +1397,16 @@ def main():
             train_dataset,
             k=3,  # 3-fold for faster execution
             epochs=30,
-            batch_size=4,  # Reduced for GTX 1050 (2GB VRAM)
+            batch_size=4,  # Optimized for GTX 1050
             lr=0.001,
-            patience=5,  # Early stopping patience
-            use_amp=True  # Mixed precision for memory efficiency
+            patience=3,  # Early stopping patience
+            use_amp=True,  # Mixed precision for memory efficiency
+            num_workers=6,  # CPU bottleneck fix: More workers
+            persistent_workers=True,  # CPU bottleneck fix: Keep workers alive
+            prefetch_factor=4  # CPU bottleneck fix: Prefetch more batches
         )
         trained_models[model_type] = models[0]  # Use first fold model
+        training_times[model_type] = trainer.training_time  # Store training time
 
     # 5. Evaluate and Compare
     print("\n### STEP 4: Model Evaluation and Comparison ###")
@@ -1259,8 +1416,8 @@ def main():
     for model_name, model in trained_models.items():
         evaluator.evaluate_model(model, test_loader, model_name)
 
-    # Generate comparison
-    comparison_df = evaluator.compare_models()
+    # Generate comparison with training times
+    comparison_df = evaluator.compare_models(training_times=training_times)
 
     # 6. Visualize Predictions
     print("\n### STEP 5: Visualizing Predictions ###")
@@ -1467,8 +1624,8 @@ def advanced_example():
         'n_samples': 200,
         'img_size': (512, 512),
         'n_bands': 13,  # Full Sentinel-2 bands
-        'k_folds': 5,
-        'epochs': 50,
+        'k_folds': 3,
+        'epochs': 30,
         'batch_size': 16,
         'learning_rate': 0.0001
     }
@@ -1491,21 +1648,17 @@ if __name__ == '__main__':
     main()
 
     # Uncomment for quick start or advanced examples
-    # quick_start_example()
+    #quick_start_example()
     # advanced_example()
 
-
-# NOTES
     """
     Validation methods . pixel similiarity error, brightness,contrast,
-    training time comparison
-    early stopping
     
-    to do:
-    1. Moving calculations to GPU:
-    
+    autotune vs no autotune
+    cpu/ram bottleneck
+
     2. Implementing Sentinel-2 data:
-        - copernicus sci hub
+        - 
     
     3. Model improvements:
        - Add attention mechanisms
