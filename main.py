@@ -38,16 +38,6 @@ class SatelliteDatasetPreparer:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(exist_ok=True)
 
-    def download_sentinel2_sample(self):
-        """
-        Download sample Sentinel-2 data
-        For real implementation, use: sentinelsat, Google Earth Engine, or AWS S3
-        """
-        print("Note: For real data, integrate with:")
-        print("- Sentinelsat API for Sentinel-2")
-        print("- Google Earth Engine Python API")
-        print("- AWS S3 for Landsat/Sentinel data")
-        print("\nCreating synthetic dataset for demonstration...")
 
     def create_synthetic_dataset(self, n_samples=100, img_size=(256, 256), n_bands=4):
         """Create synthetic multispectral images with simulated clouds"""
@@ -1386,8 +1376,8 @@ def main():
     # 4. Train Models with K-Fold
     print("\n### STEP 3: Model Training with K-Fold CV ###")
 
-    #model_types = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']
-    model_types = ['GAN']
+    model_types = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']
+    #model_types = ['GAN']
     trained_models = {}
     training_times = {}  # Track training time for each model
 
@@ -1652,6 +1642,10 @@ if __name__ == '__main__':
     # advanced_example()
 
     """
+    
+    
+    
+    
     Validation methods . pixel similiarity error, brightness,contrast,
     
     autotune vs no autotune
