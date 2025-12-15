@@ -1348,57 +1348,188 @@ class ModelEvaluator:
 def main():
     """Main execution pipeline"""
 
-    print("="*60)
+    print("=" * 60)
     print("SATELLITE CLOUD REMOVAL - ML/DL COMPARISON PROJECT")
-    print("="*60)
+    print("=" * 60)
 
-    # 1. Data Preparation
-    print("\n### STEP 1: Data Preparation ###")
-    preparer = SatelliteDatasetPreparer()
-    clean_dir, cloudy_dir = preparer.create_synthetic_dataset(n_samples=100)
+    # Choose dataset type
+    print("\n### STEP 0: Dataset Selection ###")
+    print("\nChoose your dataset:")
+    print("1. Synthetic data (quick test, ~100 samples)")
+    print("2. SEN12MS-CR dataset (real data, spring + winter)")
 
-    dataset = SatelliteDataset(clean_dir, cloudy_dir)
+    choice = input("\nEnter choice (1-2, or press Enter for synthetic): ").strip()
 
-    # 2. Data Exploration
-    print("\n### STEP 2: Data Exploration ###")
-    explorer = DataExplorer(dataset)
-    explorer.analyze_dataset()
+    if choice == '2':
+        # Use SEN12MS-CR dataset
+        try:
+            import sys
+            # Try to import from sen12mscr_dataset.py
+            try:
+                from sen12mscr_dataset import SEN12MSCRDataset
+            except ImportError:
+                print("\n⚠ sen12mscr_dataset.py not found in current directory")
+                print("Please ensure sen12mscr_dataset.py is in the same folder")
+                choice = '1'
 
-    # 3. Split data
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [train_size, test_size]
-    )
+            if choice == '2':
+                dataset_path = Path('./sen12mscr_dataset/organized')
+
+                if not dataset_path.exists():
+                    print("\n⚠ SEN12MS-CR organized dataset not found!")
+                    print("\nSetup required:")
+                    print("1. Place your tar files in current directory:")
+                    print("   - ROIs1158_spring_s1.tar")
+                    print("   - ROIs1158_spring_s2_cloudy.tar")
+                    print("   - ROIs2017_winter_s1.tar")
+                    print("   - ROIs2017_winter_s2_cloudy.tar")
+                    print("\n2. Run: python sen12mscr_dataset.py")
+                    print("3. Choose option 1: Extract and organize")
+                    print("\nUsing synthetic data instead...")
+                    choice = '1'
+                else:
+                    print(f"\n✓ Loading SEN12MS-CR dataset from {dataset_path}")
+
+                    # Ask about bands
+                    print("\nSelect bands to use:")
+                    print("1. RGB + NIR (bands 2,3,4,8 - recommended, fastest)")
+                    print("2. All 13 bands (complete Sentinel-2, slower)")
+                    print("3. Custom bands")
+
+                    band_choice = input("Enter choice (1-3): ").strip()
+
+                    if band_choice == '2':
+                        bands = list(range(1, 14))  # All bands
+                        print("Using all 13 Sentinel-2 bands")
+                    elif band_choice == '3':
+                        bands_input = input("Enter band numbers (e.g., 2,3,4,8): ")
+                        bands = [int(b.strip()) for b in bands_input.split(',')]
+                        print(f"Using bands: {bands}")
+                    else:
+                        bands = [2, 3, 4, 8]  # Default: Blue, Green, Red, NIR
+                        print("Using RGB + NIR (4 bands)")
+
+                    # Load dataset
+                    train_dataset = SEN12MSCRDataset(
+                        dataset_path,
+                        split='train',
+                        bands=bands,
+                        use_s1=False,  # Not using SAR for now
+                        preload=False  # Don't preload large dataset
+                    )
+
+                    val_dataset = SEN12MSCRDataset(
+                        dataset_path,
+                        split='val',
+                        bands=bands,
+                        use_s1=False,
+                        preload=False
+                    )
+
+                    # Create test dataset from validation
+                    test_dataset = val_dataset
+
+                    print(f"\nDataset loaded successfully!")
+                    print(f"Training samples: {len(train_dataset)}")
+                    print(f"Validation samples: {len(val_dataset)}")
+                    print(f"Bands: {len(bands)}")
+
+        except Exception as e:
+            print(f"\n✗ Error loading SEN12MS-CR dataset: {e}")
+            print("Using synthetic data instead...")
+            choice = '1'
+
+    # Default: Synthetic data
+    if choice != '2':
+        print("\n### STEP 1: Data Preparation ###")
+        preparer = SatelliteDatasetPreparer()
+        clean_dir, cloudy_dir = preparer.create_synthetic_dataset(n_samples=100)
+
+        dataset = SatelliteDataset(clean_dir, cloudy_dir, preload=True)
+
+        # Split data
+        train_size = int(0.8 * len(dataset))
+        test_size = len(dataset) - train_size
+        train_dataset, test_dataset = torch.utils.data.random_split(
+            dataset, [train_size, test_size]
+        )
+
+        # Data Exploration
+        print("\n### STEP 2: Data Exploration ###")
+        explorer = DataExplorer(dataset)
+        explorer.analyze_dataset()
 
     test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False)
 
-    # 4. Train Models with K-Fold
+    # Train Models with K-Fold
     print("\n### STEP 3: Model Training with K-Fold CV ###")
 
-    model_types = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']
-    #model_types = ['GAN']
+    # Adjust settings based on dataset
+    if choice == '2':
+        # SEN12MS-CR: Large dataset, adjust parameters
+        print("\n⚙ Optimized settings for SEN12MS-CR dataset")
+        k_folds = 3
+        epochs = 30
+        batch_size = 4
+        patience = 7
+
+        # Adjust input channels based on bands
+        input_channels = len(bands) if choice == '2' else 4
+        print(f"Model input channels: {input_channels}")
+    else:
+        # Synthetic: Small dataset
+        k_folds = 3
+        epochs = 30
+        batch_size = 4
+        patience = 5
+        input_channels = 4
+
+    # Ask which models to train
+    print("\nWhich models would you like to train?")
+    print("1. All models (SimpleCNN, UNet, GAN, LSTM, Diffusion)")
+    print("2. Fast models only (SimpleCNN, UNet)")
+    print("3. Best models only (UNet, GAN)")
+    print("4. Single model (choose one)")
+
+    model_choice = input("Enter choice (1-4): ").strip()
+
+    if model_choice == '2':
+        model_types = ['SimpleCNN', 'UNet']
+    elif model_choice == '3':
+        model_types = ['UNet', 'GAN']
+    elif model_choice == '4':
+        print("\nAvailable models:")
+        print("1. SimpleCNN  2. UNet  3. GAN  4. LSTM  5. Diffusion")
+        single = input("Enter number: ").strip()
+        model_map = {'1': 'SimpleCNN', '2': 'UNet', '3': 'GAN',
+                     '4': 'LSTM', '5': 'Diffusion'}
+        model_types = [model_map.get(single, 'UNet')]
+    else:
+        model_types = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']
+
+    print(f"\nTraining models: {', '.join(model_types)}")
+
     trained_models = {}
-    training_times = {}  # Track training time for each model
+    training_times = {}
 
     for model_type in model_types:
         trainer = ModelTrainer(model_type)
         models, histories = trainer.train_kfold(
             train_dataset,
-            k=3,  # 3-fold for faster execution
-            epochs=30,
-            batch_size=4,  # Optimized for GTX 1050
+            k=k_folds,
+            epochs=epochs,
+            batch_size=batch_size,
             lr=0.001,
-            patience=3,  # Early stopping patience
-            use_amp=True,  # Mixed precision for memory efficiency
-            num_workers=6,  # CPU bottleneck fix: More workers
-            persistent_workers=True,  # CPU bottleneck fix: Keep workers alive
-            prefetch_factor=4  # CPU bottleneck fix: Prefetch more batches
+            patience=patience,
+            use_amp=True,
+            num_workers=6,
+            persistent_workers=True,
+            prefetch_factor=4
         )
-        trained_models[model_type] = models[0]  # Use first fold model
-        training_times[model_type] = trainer.training_time  # Store training time
+        trained_models[model_type] = models[0]
+        training_times[model_type] = trainer.training_time
 
-    # 5. Evaluate and Compare
+    # Evaluate and Compare
     print("\n### STEP 4: Model Evaluation and Comparison ###")
 
     evaluator = ModelEvaluator()
@@ -1406,21 +1537,36 @@ def main():
     for model_name, model in trained_models.items():
         evaluator.evaluate_model(model, test_loader, model_name)
 
-    # Generate comparison with training times
     comparison_df = evaluator.compare_models(training_times=training_times)
 
-    # 6. Visualize Predictions
+    # Visualize Predictions
     print("\n### STEP 5: Visualizing Predictions ###")
     visualize_predictions(trained_models, test_dataset)
 
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("PROJECT COMPLETED SUCCESSFULLY!")
-    print("="*60)
+    print("=" * 60)
     print("\nGenerated files:")
-    print("- spectral_profiles.png")
-    print("- sample_pairs.png")
     print("- model_comparison.png")
+    print("- time_vs_quality.png")
     print("- predictions_comparison.png")
+    if choice != '2':
+        print("- spectral_profiles.png")
+        print("- sample_pairs.png")
+
+    # Dataset-specific notes
+    if choice == '2':
+        print("\n✓ Trained on SEN12MS-CR dataset (real Sentinel-2 data)")
+        print(f"  - Training samples: {len(train_dataset)}")
+        print(f"  - Validation samples: {len(val_dataset)}")
+        print(f"  - Spectral bands: {len(bands)}")
+        print(f"  - Seasons: Spring + Winter")
+    else:
+        print("\n📝 Note: You used synthetic data. For better results:")
+        print("   1. Download SEN12MS-CR dataset from TUM")
+        print("   2. Extract tar files to current directory")
+        print("   3. Run: python sen12mscr_dataset.py (option 1)")
+        print("   4. Run this script again and choose option 2")
 
 
 def visualize_predictions(models, test_dataset, n_samples=3):
@@ -1504,24 +1650,7 @@ def save_models(models, save_dir='./saved_models'):
         print(f"Saved {model_name} to {path}")
 
 
-def load_real_sentinel2_data(data_path):
-    """
-    Load real Sentinel-2 data using rasterio
 
-    Example usage with real data:
-    ```python
-    import rasterio
-
-    with rasterio.open('sentinel2_image.tif') as src:
-        bands = src.read()  # Read all bands
-        metadata = src.meta
-    ```
-    """
-    print("For loading real Sentinel-2 data:")
-    print("1. Install: pip install sentinelsat rasterio")
-    print("2. Download data from Copernicus Open Access Hub")
-    print("3. Use rasterio to read multispectral bands")
-    print("4. Preprocess: normalize, align, create cloud masks")
 
 
 # ==================== ADVANCED FEATURES ====================
