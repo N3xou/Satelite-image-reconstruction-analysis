@@ -106,40 +106,56 @@ class SEN12MSCRExtractor:
         print("ORGANIZING DATASET STRUCTURE")
         print("="*70)
 
-        # Find all S2 cloudy and S1 directories
-        spring_s2_cloudy = self.output_dir / 'ROIs1158_spring_s2_cloudy' / 'ROIs1158_spring' / 's2_cloudy'
-        spring_s1 = self.output_dir / 'ROIs1158_spring_s1' / 'ROIs1158_spring' / 's1'
+        all_tif_files = list(self.output_dir.rglob('*.tif'))
 
-        winter_s2_cloudy = self.output_dir / 'ROIs2017_winter_s2_cloudy' / 'ROIs2017_winter' / 's2_cloudy'
-        winter_s1 = self.output_dir / 'ROIs2017_winter_s1' / 'ROIs2017_winter' / 's1'
+        print(f"Found {len(all_tif_files)} total .tif files")
 
         # Collect all image paths
         all_cloudy_images = []
         all_s1_images = []
+        for tif_file in all_tif_files:
+            # Check if path contains indicators
+            path_str = str(tif_file)
 
+            # S2 cloudy files typically in paths with 's2' or 'cloudy'
+            if 's2_cloudy' in path_str.lower() or ('s2' in path_str.lower() and 'cloudy' in path_str.lower()):
+                all_cloudy_images.append(tif_file)
+            # S1 files typically in paths with 's1'
+            elif 's1' in path_str.lower():
+                all_s1_images.append(tif_file)
+            # If unclear, check parent directory names
+            else:
+                parent_names = [p.lower() for p in tif_file.parts]
+                if 's2_cloudy' in parent_names or 'cloudy' in parent_names:
+                    all_cloudy_images.append(tif_file)
+                elif 's1' in parent_names:
+                    all_s1_images.append(tif_file)
         print("\nCollecting images...")
 
-        # Spring data
-        if spring_s2_cloudy.exists():
-            spring_cloudy = sorted(list(spring_s2_cloudy.glob('**/*.tif')))
-            all_cloudy_images.extend(spring_cloudy)
-            print(f"  Spring S2 cloudy: {len(spring_cloudy)} images")
+        print(f"\n📊 Classification Results:")
+        print(f"  S2 Cloudy images: {len(all_cloudy_images)}")
+        print(f"  S1 SAR images: {len(all_s1_images)}")
 
-        if spring_s1.exists():
-            spring_s1_imgs = sorted(list(spring_s1.glob('**/*.tif')))
-            all_s1_images.extend(spring_s1_imgs)
-            print(f"  Spring S1: {len(spring_s1_imgs)} images")
+        if len(all_cloudy_images) == 0 and len(all_s1_images) == 0:
+            print("\n❌ No images found!")
+            print("\n💡 Let's explore the actual structure:")
+            self.explore_structure()
+            print("\n⚠️  Please check the structure above and verify:")
+            print("   1. Tar files were extracted correctly")
+            print("   2. .tif files exist in the extracted directories")
+            return None
 
-        # Winter data
-        if winter_s2_cloudy.exists():
-            winter_cloudy = sorted(list(winter_s2_cloudy.glob('**/*.tif')))
-            all_cloudy_images.extend(winter_cloudy)
-            print(f"  Winter S2 cloudy: {len(winter_cloudy)} images")
+        # Show sample paths to verify
+        if all_cloudy_images:
+            print(f"\n📝 Sample S2 cloudy path:")
+            print(f"   {all_cloudy_images[0]}")
+        if all_s1_images:
+            print(f"\n📝 Sample S1 path:")
+            print(f"   {all_s1_images[0]}")
 
-        if winter_s1.exists():
-            winter_s1_imgs = sorted(list(winter_s1.glob('**/*.tif')))
-            all_s1_images.extend(winter_s1_imgs)
-            print(f"  Winter S1: {len(winter_s1_imgs)} images")
+        # Sort for consistency
+        all_cloudy_images = sorted(all_cloudy_images)
+        all_s1_images = sorted(all_s1_images)
 
         print(f"\nTotal cloudy images: {len(all_cloudy_images)}")
         print(f"Total S1 images: {len(all_s1_images)}")
@@ -678,7 +694,10 @@ if __name__ == '__main__':
             print("\n✓ Analysis complete!")
         except Exception as e:
             print(f"\n✗ Error: {e}")
-
+    elif choice == '6':
+        print('extracting')
+        extractor = SEN12MSCRExtractor('./sen12mscr_dataset')
+        organized_dir = extractor.organize_structure()
     else:
         print("Exiting...")
 
