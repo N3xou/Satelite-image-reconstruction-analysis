@@ -1,18 +1,19 @@
 """
 SEN12MS-CR Dataset Loader
 =========================
-Sentinel-1/2 Cloud Removal Dataset from TUM
-Supports: Spring and Winter ROIs with cloudy Sentinel-2 data
+Complete implementation for Sentinel-1/2 Cloud Removal Dataset
+Supports: All seasons (Spring, Summer, Fall, Winter)
+Reference: Official SEN12MS-CR data loader
 """
 
 import os
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from pathlib import Path
 import tarfile
-import shutil
 from sklearn.model_selection import train_test_split
+from enum import Enum
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -25,12 +26,47 @@ except ImportError:
     RASTERIO_AVAILABLE = False
 
 
-# ==================== SEN12MS-CR DATASET EXTRACTOR ====================
+# ==================== ENUMS FROM OFFICIAL LOADER ====================
+
+class S1Bands(Enum):
+    """Sentinel-1 SAR bands"""
+    VV = 1
+    VH = 2
+    ALL = [VV, VH]
+
+
+class S2Bands(Enum):
+    """Sentinel-2 multispectral bands"""
+    B01 = 1   # Coastal Aerosol
+    B02 = 2   # Blue
+    B03 = 3   # Green
+    B04 = 4   # Red
+    B05 = 5   # Red Edge 1
+    B06 = 6   # Red Edge 2
+    B07 = 7   # Red Edge 3
+    B08 = 8   # NIR
+    B08A = 9  # Narrow NIR
+    B09 = 10  # Water Vapor
+    B10 = 11  # SWIR Cirrus
+    B11 = 12  # SWIR 1
+    B12 = 13  # SWIR 2
+    ALL = [B01, B02, B03, B04, B05, B06, B07, B08, B08A, B09, B10, B11, B12]
+    RGB = [B04, B03, B02]
+
+
+class Seasons(Enum):
+    """Available seasons in SEN12MS-CR"""
+    SPRING = "ROIs1158_spring"
+    SUMMER = "ROIs1868_summer"
+    FALL = "ROIs1970_fall"
+    WINTER = "ROIs2017_winter"
+    ALL = [SPRING, SUMMER, FALL, WINTER]
+
+
+# ==================== TAR EXTRACTOR ====================
 
 class SEN12MSCRExtractor:
-    """
-    Extract and organize SEN12MS-CR dataset from tar files
-    """
+    """Extract and organize SEN12MS-CR tar files"""
 
     def __init__(self, output_dir='./sen12mscr_dataset'):
         self.output_dir = Path(output_dir)
@@ -38,22 +74,21 @@ class SEN12MSCRExtractor:
 
     def extract_all(self, tar_files):
         """
-        Extract all tar files and organize structure
+        Extract all tar files
 
-        Args:
-            tar_files: List of paths to tar files
+        Expected tar file patterns:
+        - ROIsXXXX_season_s1.tar (Sentinel-1 SAR)
+        - ROIsXXXX_season_s2.tar (Sentinel-2 clean)
+        - ROIsXXXX_season_s2_cloudy.tar (Sentinel-2 cloudy)
 
-        Expected files:
-        - ROIs1158_spring_s1.tar
-        - ROIs1158_spring_s2_cloudy.tar
-        - ROIs2017_winter_s1.tar
-        - ROIs2017_winter_s2_cloudy.tar
+        Where XXXX is the ROI number (1158, 1868, 1970, 2017)
+        and season is spring, summer, fall, or winter
         """
         print("\n" + "="*70)
         print("SEN12MS-CR DATASET EXTRACTION")
         print("="*70)
 
-        extracted_dirs = []
+        extracted_seasons = set()
 
         for tar_file in tar_files:
             tar_path = Path(tar_file)
@@ -64,424 +99,337 @@ class SEN12MSCRExtractor:
 
             print(f"\nExtracting {tar_path.name}...")
 
+            # Extract season name from filename
+            # Format: ROIsXXXX_season_sensor.tar
+            parts = tar_path.stem.split('_')
+            if len(parts) >= 2:
+                season = parts[1]  # spring, summer, fall, winter
+                extracted_seasons.add(season)
+
             # Extract to output directory
             with tarfile.open(tar_path, 'r') as tar:
                 tar.extractall(self.output_dir)
                 print(f"  ✓ Extracted to {self.output_dir}")
 
-                # Get extracted directory name
-                members = tar.getmembers()
-                if members:
-                    root_dir = members[0].name.split('/')[0]
-                    extracted_dirs.append(self.output_dir / root_dir)
-
         print("\n" + "="*70)
-        print(f"Extraction complete! Extracted {len(extracted_dirs)} directories")
+        print(f"Extraction complete!")
+        print(f"Extracted seasons: {', '.join(sorted(extracted_seasons))}")
         print("="*70)
 
-        return extracted_dirs
+        return extracted_seasons
 
-    def organize_structure(self):
-        """
-        Organize extracted files into train/val structure
-
-        Expected after extraction:
-        sen12mscr_dataset/
-        ├── ROIs1158_spring_s1/
-        ├── ROIs1158_spring_s2_cloudy/
-        ├── ROIs2017_winter_s1/
-        └── ROIs2017_winter_s2_cloudy/
-
-        Will create:
-        sen12mscr_dataset/
-        ├── organized/
-        │   ├── train/
-        │   │   ├── cloudy/
-        │   │   └── s1/
-        │   └── val/
-        │       ├── cloudy/
-        │       └── s1/
-        """
+    def verify_structure(self):
+        """Verify the extracted dataset structure"""
         print("\n" + "="*70)
-        print("ORGANIZING DATASET STRUCTURE")
+        print("VERIFYING DATASET STRUCTURE")
         print("="*70)
 
-        all_tif_files = list(self.output_dir.rglob('*.tif'))
+        found_seasons = []
 
-        print(f"Found {len(all_tif_files)} total .tif files")
+        for season_enum in Seasons:
+            if season_enum == Seasons.ALL:
+                continue
 
-        # Collect all image paths
-        all_cloudy_images = []
-        all_s1_images = []
-        for tif_file in all_tif_files:
-            # Check if path contains indicators
-            path_str = str(tif_file)
+            season_name = season_enum.value
+            season_path = self.output_dir / season_name
 
-            # S2 cloudy files typically in paths with 's2' or 'cloudy'
-            if 's2_cloudy' in path_str.lower() or ('s2' in path_str.lower() and 'cloudy' in path_str.lower()):
-                all_cloudy_images.append(tif_file)
-            # S1 files typically in paths with 's1'
-            elif 's1' in path_str.lower():
-                all_s1_images.append(tif_file)
-            # If unclear, check parent directory names
-            else:
-                parent_names = [p.lower() for p in tif_file.parts]
-                if 's2_cloudy' in parent_names or 'cloudy' in parent_names:
-                    all_cloudy_images.append(tif_file)
-                elif 's1' in parent_names:
-                    all_s1_images.append(tif_file)
-        print("\nCollecting images...")
+            if season_path.exists():
+                print(f"\n✓ Found season: {season_name}")
+                found_seasons.append(season_name)
 
-        print(f"\n📊 Classification Results:")
-        print(f"  S2 Cloudy images: {len(all_cloudy_images)}")
-        print(f"  S1 SAR images: {len(all_s1_images)}")
+                # Count scenes (directories like s1_XXX, s2_XXX)
+                s1_scenes = list(season_path.glob('s1_*'))
+                s2_scenes = list(season_path.glob('s2_*'))
 
-        if len(all_cloudy_images) == 0 and len(all_s1_images) == 0:
-            print("\n❌ No images found!")
-            print("\n💡 Let's explore the actual structure:")
-            self.explore_structure()
-            print("\n⚠️  Please check the structure above and verify:")
-            print("   1. Tar files were extracted correctly")
-            print("   2. .tif files exist in the extracted directories")
-            return None
+                print(f"  S1 scenes: {len(s1_scenes)}")
+                print(f"  S2 scenes: {len(s2_scenes)}")
 
-        # Show sample paths to verify
-        if all_cloudy_images:
-            print(f"\n📝 Sample S2 cloudy path:")
-            print(f"   {all_cloudy_images[0]}")
-        if all_s1_images:
-            print(f"\n📝 Sample S1 path:")
-            print(f"   {all_s1_images[0]}")
+                # Count patches in first scene
+                if s1_scenes:
+                    patches = list(s1_scenes[0].glob('*.tif'))
+                    print(f"  Patches per scene (sample): {len(patches)}")
 
-        # Sort for consistency
-        all_cloudy_images = sorted(all_cloudy_images)
-        all_s1_images = sorted(all_s1_images)
+        if not found_seasons:
+            print("\n✗ No season directories found!")
+            print("Expected structure after extraction:")
+            print("  sen12mscr_dataset/")
+            print("    ROIs1158_spring/")
+            print("    ROIs1868_summer/")
+            print("    ROIs1970_fall/")
+            print("    ROIs2017_winter/")
 
-        print(f"\nTotal cloudy images: {len(all_cloudy_images)}")
-        print(f"Total S1 images: {len(all_s1_images)}")
-
-        # Create organized directory structure
-        organized_dir = self.output_dir / 'organized'
-        train_cloudy_dir = organized_dir / 'train' / 'cloudy'
-        train_s1_dir = organized_dir / 'train' / 's1'
-        val_cloudy_dir = organized_dir / 'val' / 'cloudy'
-        val_s1_dir = organized_dir / 'val' / 's1'
-
-        for dir_path in [train_cloudy_dir, train_s1_dir, val_cloudy_dir, val_s1_dir]:
-            dir_path.mkdir(exist_ok=True, parents=True)
-
-        # Split into train/val (80/20)
-        train_cloudy, val_cloudy = train_test_split(
-            all_cloudy_images,
-            test_size=0.2,
-            random_state=42
-        )
-
-        train_s1, val_s1 = train_test_split(
-            all_s1_images,
-            test_size=0.2,
-            random_state=42
-        )
-
-        print(f"\nSplit:")
-        print(f"  Train: {len(train_cloudy)} cloudy, {len(train_s1)} S1")
-        print(f"  Val:   {len(val_cloudy)} cloudy, {len(val_s1)} S1")
-
-        # Create symbolic links or copy files
-        print("\nCreating organized structure...")
-
-        self._create_links(train_cloudy, train_cloudy_dir)
-        self._create_links(train_s1, train_s1_dir)
-        self._create_links(val_cloudy, val_cloudy_dir)
-        self._create_links(val_s1, val_s1_dir)
-
-        print("\n✓ Organization complete!")
-        print(f"Organized dataset location: {organized_dir}")
-
-        # Save file list for reference
-        self._save_file_lists(
-            organized_dir,
-            train_cloudy, val_cloudy,
-            train_s1, val_s1
-        )
-
-        return organized_dir
-
-    def _create_links(self, file_list, target_dir):
-        """Create symbolic links or copy files"""
-        for i, file_path in enumerate(file_list):
-            target_path = target_dir / f"{i:06d}.tif"
-
-            # Try symbolic link first (faster)
-            try:
-                if not target_path.exists():
-                    os.symlink(file_path, target_path)
-            except OSError:
-                # If symlink fails, copy instead
-                if not target_path.exists():
-                    shutil.copy2(file_path, target_path)
-
-            if (i + 1) % 1000 == 0:
-                print(f"    Processed {i + 1}/{len(file_list)} files...")
-
-    def _save_file_lists(self, organized_dir, train_cloudy, val_cloudy, train_s1, val_s1):
-        """Save lists of original file paths"""
-        lists_dir = organized_dir / 'file_lists'
-        lists_dir.mkdir(exist_ok=True)
-
-        def save_list(file_list, filename):
-            with open(lists_dir / filename, 'w') as f:
-                for file_path in file_list:
-                    f.write(f"{file_path}\n")
-
-        save_list(train_cloudy, 'train_cloudy.txt')
-        save_list(val_cloudy, 'val_cloudy.txt')
-        save_list(train_s1, 'train_s1.txt')
-        save_list(val_s1, 'val_s1.txt')
-
-        print(f"  ✓ Saved file lists to {lists_dir}")
+        return found_seasons
 
 
-# ==================== SEN12MS-CR DATASET ====================
+# ==================== PYTORCH DATASET ====================
 
 class SEN12MSCRDataset(Dataset):
     """
     PyTorch Dataset for SEN12MS-CR
 
-    Dataset Information:
-    - Sentinel-2 cloudy images (13 bands)
-    - Sentinel-1 SAR images (2 bands: VV, VH)
-    - Resolution: 256x256 pixels
-    - Format: GeoTIFF
-
-    Note: This dataset contains cloudy S2 and S1 (for cloud removal using SAR)
-          Clean S2 images are in separate files (not downloaded)
+    Loads triplets of: S1 (SAR), S2 (clean), S2_cloudy
+    For cloud removal, we use: S2_cloudy as input, S2 as target
     """
 
-    def __init__(self, root_dir, split='train', bands=[2,3,4,8],
-                 use_s1=False, transform=None, preload=False, cache_size=100):
+    def __init__(self, base_dir, seasons=None, s1_bands=None, s2_bands=None,
+                 split='train', val_split=0.2, random_state=42,
+                 transform=None, use_s1=False):
         """
         Args:
-            root_dir: Path to organized dataset directory
+            base_dir: Path to sen12mscr_dataset
+            seasons: List of season names or 'all'. e.g., ['spring', 'winter']
+            s1_bands: List of S1 band numbers [1,2] or None for all
+            s2_bands: List of S2 band numbers [1-13] or None for all
             split: 'train' or 'val'
-            bands: Which S2 bands to use (1-13). Default: [2,3,4,8] = Blue,Green,Red,NIR
-            use_s1: If True, also load Sentinel-1 SAR data
+            val_split: Validation split ratio (0.2 = 20%)
+            random_state: Random seed for reproducibility
             transform: Optional transforms
-            preload: If True, load all to RAM
-            cache_size: Number of images to cache
+            use_s1: If True, return (s1, s2_cloudy) as input
         """
         if not RASTERIO_AVAILABLE:
-            raise ImportError("rasterio is required. Install: pip install rasterio")
+            raise ImportError("rasterio required: pip install rasterio")
 
-        self.root_dir = Path(root_dir)
+        self.base_dir = Path(base_dir)
         self.split = split
-        self.bands = bands
-        self.use_s1 = use_s1
         self.transform = transform
-        self.preload = preload
-        self.cache = {}
-        self.cache_size = cache_size
+        self.use_s1 = use_s1
 
-        # Paths
-        self.cloudy_dir = self.root_dir / split / 'cloudy'
-        self.s1_dir = self.root_dir / split / 's1'
+        # Default to all bands if not specified
+        self.s1_bands = s1_bands if s1_bands else [1, 2]
+        self.s2_bands = s2_bands if s2_bands else list(range(1, 14))
 
-        if not self.cloudy_dir.exists():
-            raise FileNotFoundError(
-                f"Cloudy directory not found: {self.cloudy_dir}\n"
-                f"Please run extraction and organization first."
-            )
+        # Parse seasons
+        if seasons is None or seasons == 'all':
+            self.seasons = [s.value for s in Seasons if s != Seasons.ALL]
+        else:
+            # Convert to full names
+            season_map = {
+                'spring': 'ROIs1158_spring',
+                'summer': 'ROIs1868_summer',
+                'fall': 'ROIs1970_fall',
+                'winter': 'ROIs2017_winter'
+            }
+            self.seasons = [season_map.get(s.lower(), s) for s in seasons]
 
-        # Get image files
-        self.cloudy_files = sorted(list(self.cloudy_dir.glob('*.tif')))
-
-        if use_s1:
-            self.s1_files = sorted(list(self.s1_dir.glob('*.tif')))
-            # Match S2 and S1 pairs
-            self.cloudy_files = self.cloudy_files[:min(len(self.cloudy_files), len(self.s1_files))]
-            self.s1_files = self.s1_files[:len(self.cloudy_files)]
-
+        # Collect all patch paths
         print(f"\n{'='*60}")
-        print(f"SEN12MS-CR Dataset - {split.upper()} Split")
+        print(f"Loading SEN12MS-CR Dataset - {split.upper()} Split")
         print(f"{'='*60}")
-        print(f"Directory: {self.root_dir}")
-        print(f"Split: {split}")
-        print(f"S2 Cloudy images: {len(self.cloudy_files)}")
+        print(f"Base directory: {self.base_dir}")
+        print(f"Seasons: {self.seasons}")
+        print(f"S2 bands: {self.s2_bands}")
         if use_s1:
-            print(f"S1 SAR images: {len(self.s1_files)}")
-        print(f"Selected S2 bands: {bands}")
-        print(f"Band names: {self._get_band_names(bands)}")
-        print(f"Resolution: 256x256 pixels")
+            print(f"S1 bands: {self.s1_bands}")
 
-        # Preload if requested
-        if preload and len(self.cloudy_files) <= cache_size:
-            print(f"\nPreloading {len(self.cloudy_files)} images to RAM...")
-            for idx in range(len(self.cloudy_files)):
-                if idx % 100 == 0:
-                    print(f"  Loaded {idx}/{len(self.cloudy_files)} images...")
-                self.cache[idx] = self._load_from_disk(idx)
-            print(f"✓ Preloading complete!")
+        self.samples = self._collect_samples()
 
+        # Split into train/val
+        if len(self.samples) == 0:
+            raise ValueError("No samples found! Check dataset structure.")
+
+        train_samples, val_samples = train_test_split(
+            self.samples,
+            test_size=val_split,
+            random_state=random_state
+        )
+
+        if split == 'train':
+            self.samples = train_samples
+        else:
+            self.samples = val_samples
+
+        print(f"Total samples: {len(self.samples)}")
         print(f"{'='*60}\n")
 
-    def _get_band_names(self, bands):
-        """Get band names for selected bands"""
-        band_names = {
-            1: 'Coastal', 2: 'Blue', 3: 'Green', 4: 'Red',
-            5: 'RedEdge1', 6: 'RedEdge2', 7: 'RedEdge3', 8: 'NIR',
-            9: 'NIR_Narrow', 10: 'WaterVapor', 11: 'SWIR_Cirrus',
-            12: 'SWIR1', 13: 'SWIR2'
-        }
-        return [band_names.get(b, f'B{b}') for b in bands]
+    def _collect_samples(self):
+        """Collect all valid (s1, s2, s2_cloudy) triplets"""
+        samples = []
 
-    def _load_from_disk(self, idx):
-        """Load image from disk"""
-        cloudy_path = self.cloudy_files[idx]
+        for season in self.seasons:
+            season_path = self.base_dir / season
 
-        try:
-            # Load S2 cloudy image
-            with rasterio.open(cloudy_path) as src:
-                # Read selected bands (bands are 1-indexed in rasterio)
-                cloudy = src.read(self.bands)
+            if not season_path.exists():
+                print(f"⚠ Season not found: {season}")
+                continue
 
-            # Normalize to [0, 1]
-            # SEN12MS-CR uses different encoding, typically 0-10000
-            cloudy = cloudy.astype(np.float32)
+            # Find all s2 scenes (these are the clean reference)
+            s2_scenes = sorted(season_path.glob('s2_*'))
 
-            # Handle different value ranges
-            if cloudy.max() > 10:
-                cloudy = cloudy / 10000.0
+            for s2_scene_dir in s2_scenes:
+                scene_id = s2_scene_dir.name.split('_')[1]
 
-            cloudy = np.clip(cloudy, 0, 1)
+                # Corresponding directories
+                s1_scene_dir = season_path / f's1_{scene_id}'
+                s2cloudy_scene_dir = season_path / f's2cloudy_{scene_id}'
 
-            # Load S1 if requested
-            s1 = None
-            if self.use_s1:
-                s1_path = self.s1_files[idx]
-                with rasterio.open(s1_path) as src:
-                    s1 = src.read()  # 2 bands: VV, VH
+                # Check if all three exist
+                if not s1_scene_dir.exists():
+                    continue
+                if not s2cloudy_scene_dir.exists():
+                    continue
 
-                # Normalize S1 (SAR data, typically in dB)
-                s1 = s1.astype(np.float32)
-                # Convert from dB to linear scale
-                s1 = np.clip((s1 + 25) / 35, 0, 1)  # Approximate normalization
+                # Get all patches in s2 (clean)
+                s2_patches = sorted(s2_scene_dir.glob('*.tif'))
 
-            # Convert to PyTorch tensors
-            cloudy = torch.from_numpy(cloudy)
+                for s2_patch_path in s2_patches:
+                    # Extract patch filename
+                    patch_filename = s2_patch_path.name
 
-            if s1 is not None:
-                s1 = torch.from_numpy(s1)
+                    # Build corresponding paths
+                    # Patch filename format: ROIsXXXX_season_s2_X_pY.tif
+                    s1_filename = patch_filename.replace('_s2_', '_s1_')
+                    s2cloudy_filename = patch_filename.replace('_s2_', '_s2cloudy_')
 
-            if self.transform:
-                cloudy = self.transform(cloudy)
-                if s1 is not None:
-                    s1 = self.transform(s1)
+                    s1_path = s1_scene_dir / s1_filename
+                    s2cloudy_path = s2cloudy_scene_dir / s2cloudy_filename
 
-            # For cloud removal, we use cloudy as both input and target
-            # (since we don't have clean reference in this subset)
-            # OR use S1 as auxiliary input
-            if self.use_s1:
-                return (cloudy, s1), cloudy  # Input: (S2_cloudy, S1), Target: S2_cloudy
-            else:
-                return cloudy, cloudy  # Input: S2_cloudy, Target: S2_cloudy (self-supervised)
+                    # Verify all exist
+                    if s1_path.exists() and s2cloudy_path.exists():
+                        samples.append({
+                            's1': s1_path,
+                            's2': s2_patch_path,
+                            's2_cloudy': s2cloudy_path,
+                            'season': season,
+                            'scene_id': scene_id
+                        })
 
-        except Exception as e:
-            print(f"Error loading {cloudy_path.name}: {e}")
-            # Return dummy data on error
-            dummy = torch.zeros(len(self.bands), 256, 256)
-            if self.use_s1:
-                dummy_s1 = torch.zeros(2, 256, 256)
-                return (dummy, dummy_s1), dummy
-            return dummy, dummy
+            print(f"  {season}: {len([s for s in samples if s['season'] == season])} patches")
+
+        return samples
 
     def __len__(self):
-        return len(self.cloudy_files)
+        return len(self.samples)
 
     def __getitem__(self, idx):
         """
         Returns:
             If use_s1=False:
-                cloudy: Tensor [bands, 256, 256]
-                cloudy: Tensor [bands, 256, 256] (same as input for self-supervised)
-
+                s2_cloudy: Input tensor [bands, H, W]
+                s2: Target tensor [bands, H, W]
             If use_s1=True:
-                (cloudy, s1): Tuple of tensors
-                cloudy: Target tensor
+                (s1, s2_cloudy): Input tuple
+                s2: Target tensor
         """
-        if idx in self.cache:
-            return self.cache[idx]
+        sample = self.samples[idx]
 
-        data = self._load_from_disk(idx)
+        try:
+            # Load S2 cloudy (input)
+            with rasterio.open(sample['s2_cloudy']) as src:
+                s2_cloudy = src.read(self.s2_bands)
 
-        if len(self.cache) < self.cache_size:
-            self.cache[idx] = data
+            # Load S2 clean (target)
+            with rasterio.open(sample['s2']) as src:
+                s2 = src.read(self.s2_bands)
 
-        return data
+            # Normalize to [0, 1]
+            s2_cloudy = s2_cloudy.astype(np.float32) / 10000.0
+            s2 = s2.astype(np.float32) / 10000.0
+
+            s2_cloudy = np.clip(s2_cloudy, 0, 1)
+            s2 = np.clip(s2, 0, 1)
+
+            # Convert to tensors
+            s2_cloudy = torch.from_numpy(s2_cloudy)
+            s2 = torch.from_numpy(s2)
+
+            if self.use_s1:
+                # Load S1 (auxiliary input)
+                with rasterio.open(sample['s1']) as src:
+                    s1 = src.read(self.s1_bands)
+
+                # S1 is in dB, normalize
+                s1 = s1.astype(np.float32)
+                s1 = np.clip((s1 + 25) / 35, 0, 1)
+                s1 = torch.from_numpy(s1)
+
+                if self.transform:
+                    s1 = self.transform(s1)
+                    s2_cloudy = self.transform(s2_cloudy)
+                    s2 = self.transform(s2)
+
+                return (s1, s2_cloudy), s2
+            else:
+                if self.transform:
+                    s2_cloudy = self.transform(s2_cloudy)
+                    s2 = self.transform(s2)
+
+                return s2_cloudy, s2
+
+        except Exception as e:
+            print(f"Error loading sample {idx}: {e}")
+            # Return dummy data
+            dummy_shape = (len(self.s2_bands), 256, 256)
+            dummy_cloudy = torch.zeros(dummy_shape)
+            dummy_clean = torch.zeros(dummy_shape)
+
+            if self.use_s1:
+                dummy_s1 = torch.zeros(len(self.s1_bands), 256, 256)
+                return (dummy_s1, dummy_cloudy), dummy_clean
+            return dummy_cloudy, dummy_clean
 
     def get_sample_info(self, idx):
         """Get information about a sample"""
-        cloudy_path = self.cloudy_files[idx]
-
-        with rasterio.open(cloudy_path) as src:
-            info = {
-                'filename': cloudy_path.name,
-                'shape': src.shape,
-                'bands': src.count,
-                'dtype': src.dtypes[0],
-                'crs': src.crs,
-                'transform': src.transform,
-                'path': str(cloudy_path)
-            }
-
-        return info
+        sample = self.samples[idx]
+        return {
+            'season': sample['season'],
+            'scene_id': sample['scene_id'],
+            's1_path': str(sample['s1']),
+            's2_path': str(sample['s2']),
+            's2_cloudy_path': str(sample['s2_cloudy'])
+        }
 
 
 # ==================== VISUALIZATION ====================
 
 def visualize_sen12mscr_samples(dataset, n_samples=3, save_path='sen12mscr_samples.png'):
-    """Visualize sample images from SEN12MS-CR"""
+    """Visualize sample triplets"""
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(n_samples, 2, figsize=(10, 4*n_samples))
+    fig, axes = plt.subplots(n_samples, 3, figsize=(12, 4*n_samples))
     if n_samples == 1:
         axes = axes.reshape(1, -1)
 
     for i in range(min(n_samples, len(dataset))):
         data = dataset[i]
 
-        # Handle both formats
         if isinstance(data[0], tuple):
-            # (cloudy, s1), target
-            cloudy, s1 = data[0]
-            target = data[1]
+            s1, s2_cloudy = data[0]
+            s2 = data[1]
         else:
-            # cloudy, target
-            cloudy = data[0]
-            target = data[1]
+            s2_cloudy = data[0]
+            s2 = data[1]
             s1 = None
 
-        # Take RGB bands (assuming bands 2,3,4 are included)
-        # Bands are 0-indexed in tensor, so if bands=[2,3,4,8], RGB is [0,1,2]
-        if cloudy.shape[0] >= 3:
-            cloudy_rgb = cloudy[:3].permute(1, 2, 0).numpy()
+        # Take RGB bands (B04=Red, B03=Green, B02=Blue = bands 4,3,2 = indices 3,2,1)
+        # Assuming full 13 bands, RGB are at indices [3,2,1]
+        if s2_cloudy.shape[0] >= 13:
+            cloudy_rgb = s2_cloudy[[3,2,1]].permute(1, 2, 0).numpy()
+            clean_rgb = s2[[3,2,1]].permute(1, 2, 0).numpy()
+        elif s2_cloudy.shape[0] >= 3:
+            cloudy_rgb = s2_cloudy[:3].permute(1, 2, 0).numpy()
+            clean_rgb = s2[:3].permute(1, 2, 0).numpy()
         else:
-            cloudy_rgb = cloudy[0].numpy()
+            cloudy_rgb = s2_cloudy[0].numpy()
+            clean_rgb = s2[0].numpy()
 
         axes[i, 0].imshow(np.clip(cloudy_rgb, 0, 1))
         axes[i, 0].set_title(f'Sample {i+1}: S2 Cloudy')
         axes[i, 0].axis('off')
 
-        if s1 is not None:
-            # Show S1 (VV band)
-            s1_img = s1[0].numpy()
-            axes[i, 1].imshow(s1_img, cmap='gray')
-            axes[i, 1].set_title(f'Sample {i+1}: S1 SAR')
-        else:
-            # Show same cloudy image
-            axes[i, 1].imshow(np.clip(cloudy_rgb, 0, 1))
-            axes[i, 1].set_title(f'Sample {i+1}: S2 Cloudy')
-
+        axes[i, 1].imshow(np.clip(clean_rgb, 0, 1))
+        axes[i, 1].set_title(f'Sample {i+1}: S2 Clean')
         axes[i, 1].axis('off')
+
+        if s1 is not None:
+            s1_img = s1[0].numpy()
+            axes[i, 2].imshow(s1_img, cmap='gray')
+            axes[i, 2].set_title(f'Sample {i+1}: S1 SAR (VV)')
+        else:
+            diff = np.abs(cloudy_rgb - clean_rgb)
+            axes[i, 2].imshow(diff)
+            axes[i, 2].set_title(f'Sample {i+1}: Difference')
+
+        axes[i, 2].axis('off')
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -490,98 +438,33 @@ def visualize_sen12mscr_samples(dataset, n_samples=3, save_path='sen12mscr_sampl
     print(f"\n✓ Saved visualization to: {save_path}")
 
 
-def analyze_sen12mscr_statistics(dataset, n_samples=500):
-    """Analyze dataset statistics"""
-    import matplotlib.pyplot as plt
-
-    print(f"\nAnalyzing {min(n_samples, len(dataset))} samples...")
-
-    all_images = []
-
-    for i in range(min(n_samples, len(dataset))):
-        if i % 100 == 0:
-            print(f"  Processed {i}/{min(n_samples, len(dataset))} samples...")
-
-        data = dataset[i]
-        if isinstance(data[0], tuple):
-            img = data[0][0].numpy()  # S2 cloudy
-        else:
-            img = data[0].numpy()
-
-        all_images.append(img)
-
-    all_images = np.array(all_images)
-
-    print("\n" + "="*60)
-    print("SEN12MS-CR Dataset Statistics")
-    print("="*60)
-    print(f"\nSamples analyzed: {len(all_images)}")
-    print(f"Image shape: {all_images.shape}")
-    print(f"\nPixel values:")
-    print(f"  Mean: {all_images.mean():.4f}")
-    print(f"  Std:  {all_images.std():.4f}")
-    print(f"  Min:  {all_images.min():.4f}")
-    print(f"  Max:  {all_images.max():.4f}")
-
-    # Per-band statistics
-    print(f"\nPer-band statistics:")
-    for i in range(all_images.shape[1]):
-        print(f"  Band {i+1}: mean={all_images[:,i].mean():.4f}, std={all_images[:,i].std():.4f}")
-
-    print("="*60)
-
-    # Plot histogram
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-
-    axes[0].hist(all_images.flatten(), bins=50, alpha=0.7, color='blue')
-    axes[0].set_title('Pixel Value Distribution')
-    axes[0].set_xlabel('Pixel Value')
-    axes[0].set_ylabel('Frequency')
-
-    # Per-band distribution
-    for i in range(min(4, all_images.shape[1])):
-        axes[1].hist(all_images[:,i].flatten(), bins=50, alpha=0.5,
-                    label=f'Band {i+1}')
-    axes[1].set_title('Per-Band Distribution')
-    axes[1].set_xlabel('Pixel Value')
-    axes[1].set_ylabel('Frequency')
-    axes[1].legend()
-
-    plt.tight_layout()
-    plt.savefig('sen12mscr_statistics.png', dpi=300, bbox_inches='tight')
-    plt.close()
-
-    print("\n✓ Saved statistics to: sen12mscr_statistics.png")
-
-
 # ==================== MAIN ====================
 
 if __name__ == '__main__':
     print("""
 ╔══════════════════════════════════════════════════════════════════════════╗
 ║  SEN12MS-CR Dataset Loader                                               ║
-║  Sentinel-1/2 Multi-Spectral Cloud Removal Dataset                      ║
+║  Sentinel-1/2 Cloud Removal Dataset                                      ║
 ╚══════════════════════════════════════════════════════════════════════════╝
     """)
 
     print("\nWhat would you like to do?")
-    print("1. Extract and organize tar files")
+    print("1. Extract tar files")
     print("2. Verify dataset structure")
     print("3. Test dataset loading")
     print("4. Visualize samples")
-    print("5. Analyze statistics")
+    print("5. Show dataset statistics")
     print("6. Exit")
 
     choice = input("\nEnter choice (1-6): ").strip()
 
     if choice == '1':
-        print("\n" + "="*70)
-        print("TAR FILE EXTRACTION")
-        print("="*70)
-
-        # Prompt for tar file locations
-        print("\nEnter paths to your downloaded tar files:")
+        print("\nEnter paths to your tar files:")
         print("(Press Enter after each path, empty line when done)")
+        print("\nExpected files (example):")
+        print("  ROIs2017_winter_s1.tar")
+        print("  ROIs2017_winter_s2.tar")
+        print("  ROIs2017_winter_s2_cloudy.tar")
 
         tar_files = []
         while True:
@@ -594,110 +477,103 @@ if __name__ == '__main__':
             else:
                 print(f"    ✗ Not found: {path}")
 
-        if not tar_files:
-            print("\nNo valid tar files provided. Using default:")
-            tar_files = [
-                './ROIs1158_spring_s1.tar',
-                './ROIs1158_spring_s2_cloudy.tar',
-                './ROIs2017_winter_s1.tar',
-                './ROIs2017_winter_s2_cloudy.tar'
-            ]
-            print("\nDefault files:")
-            for f in tar_files:
-                print(f"  - {f}")
-
-        # Extract
-        extractor = SEN12MSCRExtractor('./sen12mscr_dataset')
-        extractor.extract_all(tar_files)
-
-        # Organize
-        print("\nWould you like to organize into train/val split? (y/n)")
-        if input().strip().lower() == 'y':
-            organized_dir = extractor.organize_structure()
-            print(f"\n✓ Dataset ready at: {organized_dir}")
+        if tar_files:
+            extractor = SEN12MSCRExtractor('./sen12mscr_dataset')
+            extractor.extract_all(tar_files)
+            extractor.verify_structure()
+        else:
+            print("No valid tar files provided.")
 
     elif choice == '2':
-        print("\nVerifying dataset structure...")
+        extractor = SEN12MSCRExtractor('./sen12mscr_dataset')
+        found = extractor.verify_structure()
 
-        dataset_dir = Path('./sen12mscr_dataset/organized')
-
-        if not dataset_dir.exists():
-            print(f"✗ Organized dataset not found at: {dataset_dir}")
-            print("Run option 1 to extract and organize tar files first.")
-        else:
-            train_cloudy = dataset_dir / 'train' / 'cloudy'
-            train_s1 = dataset_dir / 'train' / 's1'
-            val_cloudy = dataset_dir / 'val' / 'cloudy'
-            val_s1 = dataset_dir / 'val' / 's1'
-
-            print(f"\n✓ Dataset structure verified:")
-            print(f"  Train cloudy: {len(list(train_cloudy.glob('*.tif')))} images")
-            print(f"  Train S1: {len(list(train_s1.glob('*.tif')))} images")
-            print(f"  Val cloudy: {len(list(val_cloudy.glob('*.tif')))} images")
-            print(f"  Val S1: {len(list(val_s1.glob('*.tif')))} images")
+        if found:
+            print(f"\n✓ Dataset is ready to use!")
+            print(f"  Found {len(found)} season(s)")
 
     elif choice == '3':
         print("\nTesting dataset loading...")
+        print("Which seasons do you have? (comma-separated, or 'all')")
+        print("Available: winter, spring, summer, fall")
+
+        seasons_input = input("Seasons: ").strip()
+        if seasons_input.lower() == 'all':
+            seasons = None
+        else:
+            seasons = [s.strip() for s in seasons_input.split(',')]
+
         try:
+            # Test with RGB + NIR
+            print("\nLoading with RGB + NIR bands [2,3,4,8]...")
             train_dataset = SEN12MSCRDataset(
-                './sen12mscr_dataset/organized',
-                split='train',
-                bands=[2, 3, 4, 8]  # Blue, Green, Red, NIR
+                './sen12mscr_dataset',
+                seasons=seasons,
+                s2_bands=[2, 3, 4, 8],  # Blue, Green, Red, NIR
+                split='train'
             )
 
             val_dataset = SEN12MSCRDataset(
-                './sen12mscr_dataset/organized',
-                split='val',
-                bands=[2, 3, 4, 8]
+                './sen12mscr_dataset',
+                seasons=seasons,
+                s2_bands=[2, 3, 4, 8],
+                split='val'
             )
 
-            print(f"\n✓ Successfully loaded datasets:")
+            print(f"\n✓ Successfully loaded!")
             print(f"  Training: {len(train_dataset)} samples")
             print(f"  Validation: {len(val_dataset)} samples")
 
             # Test loading one sample
             print("\nTesting sample loading...")
-            cloudy, target = train_dataset[0]
-            print(f"✓ Cloudy image shape: {cloudy.shape}")
-            print(f"✓ Target image shape: {target.shape}")
-            print(f"✓ Value range: [{cloudy.min():.3f}, {cloudy.max():.3f}]")
+            s2_cloudy, s2_clean = train_dataset[0]
+            print(f"✓ S2 cloudy shape: {s2_cloudy.shape}")
+            print(f"✓ S2 clean shape: {s2_clean.shape}")
+            print(f"✓ Value range: [{s2_cloudy.min():.3f}, {s2_cloudy.max():.3f}]")
+
+            # Show sample info
+            info = train_dataset.get_sample_info(0)
+            print(f"\n✓ Sample info:")
+            print(f"  Season: {info['season']}")
+            print(f"  Scene ID: {info['scene_id']}")
+
             print("\n✓ Dataset is ready to use!")
 
         except Exception as e:
             print(f"\n✗ Error: {e}")
-            print("\nPlease check:")
-            print("1. Dataset is extracted and organized")
-            print("2. Directory structure is correct")
+            import traceback
+            traceback.print_exc()
 
     elif choice == '4':
-        print("\nGenerating sample visualizations...")
+        print("\nVisualizing samples...")
+        seasons_input = input("Seasons (comma-separated or 'all'): ").strip()
+        if seasons_input.lower() == 'all':
+            seasons = None
+        else:
+            seasons = [s.strip() for s in seasons_input.split(',')]
+
         try:
             dataset = SEN12MSCRDataset(
-                './sen12mscr_dataset/organized',
-                split='train',
-                bands=[2, 3, 4, 8]
+                './sen12mscr_dataset',
+                seasons=seasons,
+                s2_bands=list(range(1, 14)),  # All bands for best RGB
+                split='train'
             )
             visualize_sen12mscr_samples(dataset, n_samples=3)
-            print("\n✓ Visualization complete!")
         except Exception as e:
-            print(f"\n✗ Error: {e}")
+            print(f"✗ Error: {e}")
 
     elif choice == '5':
-        print("\nAnalyzing dataset statistics...")
-        try:
-            dataset = SEN12MSCRDataset(
-                './sen12mscr_dataset/organized',
-                split='train',
-                bands=[2, 3, 4, 8]
-            )
-            analyze_sen12mscr_statistics(dataset, n_samples=500)
-            print("\n✓ Analysis complete!")
-        except Exception as e:
-            print(f"\n✗ Error: {e}")
-    elif choice == '6':
-        print('extracting')
+        print("\nDataset Statistics")
+        print("="*70)
+
         extractor = SEN12MSCRExtractor('./sen12mscr_dataset')
-        organized_dir = extractor.organize_structure()
+        found_seasons = extractor.verify_structure()
+
+        if found_seasons:
+            print(f"\nTotal seasons found: {len(found_seasons)}")
+            print("\nTo get full statistics, load the dataset with option 3")
+
     else:
         print("Exiting...")
 
@@ -706,7 +582,7 @@ if __name__ == '__main__':
 ║  Next Steps:                                                             ║
 ║  1. Extract tar files (option 1)                                         ║
 ║  2. Verify structure (option 2)                                          ║
-║  3. Run: python satellite_cloud_removal.py                               ║
-║  4. Choose SEN12MS-CR dataset option                                     ║
+║  3. Test loading (option 3)                                              ║
+║  4. Train models: python satellite_cloud_removal.py                      ║
 ╚══════════════════════════════════════════════════════════════════════════╝
     """)
