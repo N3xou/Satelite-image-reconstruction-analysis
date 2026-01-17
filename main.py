@@ -391,7 +391,6 @@ def main():
     # Choose sen12mscr_dataset type
     print("\n### STEP 0: Dataset Selection ###")
     print("\nChoose your sen12mscr_dataset:")
-    print("1. Synthetic data (quick test, ~100 samples)")
     print("2. SEN12MS-CR sen12mscr_dataset (real data, spring + winter)")
 
     choice = input("\nEnter choice (1-2, or press Enter for synthetic): ").strip()
@@ -406,10 +405,9 @@ def main():
             except ImportError:
                 print("\n⚠ sen12mscr_dataset.py not found in current directory")
                 print("Please ensure sen12mscr_dataset.py is in the same folder")
-                choice = '1'
 
             if choice == '2':
-                dataset_path = Path('./sen12mscr_dataset/organized')
+                dataset_path = Path('./sen12mscr_dataset/')
 
                 if not dataset_path.exists():
                     print("\n⚠ SEN12MS-CR organized sen12mscr_dataset not found!")
@@ -447,11 +445,9 @@ def main():
 
                     # Load sen12mscr_dataset
                     train_dataset = SEN12MSCRDataset(
-                        dataset_path,
-                        split='train',
-                        bands=bands,
-                        use_s1=False,  # Not using SAR for now
-                        preload=False  # Don't preload large sen12mscr_dataset
+                        seasons=None, s1_bands=None, s2_bands=None,
+                        split='small', val_split=0.2, random_state=42,
+                        transform=None, use_s1=False # Don't preload large sen12mscr_dataset
                     )
 
                     val_dataset = SEN12MSCRDataset(
@@ -725,27 +721,63 @@ class TemporalDataGenerator:
 # ==================== USAGE EXAMPLES ====================
 
 def quick_start_example():
-    """Quick start example with minimal sen12mscr_dataset"""
-    print("\n### QUICK START EXAMPLE ###\n")
+    """Quick start example using SEN12MSCRDataset"""
+    print("\n### QUICK START – SEN12MS-CR ###\n")
 
-    # Create small sen12mscr_dataset
-    preparer = SatelliteDatasetPreparer('./quick_test')
-    clean_dir, cloudy_dir = preparer.create_synthetic_dataset(n_samples=20)
+    base_dir = "./sen12mscr_dataset"  # <-- root SEN12MS-CR
 
-    # Load sen12mscr_dataset
-    dataset = SatelliteDataset(clean_dir, cloudy_dir)
+    # ---------------- DATASET ----------------
+    train_dataset = SEN12MSCRDataset(
+        base_dir=base_dir,
+        seasons=["summer"],
+        split="small",        # szybki start
+        use_s1=False,         # tylko S2
+    )
 
-    # Train single model
-    trainer = ModelTrainer('SimpleCNN')
-    models, _ = trainer.train_kfold(dataset, k=2, epochs=5, batch_size=4)
+    val_dataset = SEN12MSCRDataset(
+        base_dir=base_dir,
+        seasons=["summer"],
+        split="val",
+        use_s1=False,
+    )
 
-    # Quick evaluation
-    test_loader = DataLoader(dataset, batch_size=4)
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Val samples:   {len(val_dataset)}")
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=4,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=4,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    # ---------------- TRAINING ----------------
+    trainer = ModelTrainer("SimpleCNN")
+
+    models, history = trainer.train(
+        train_loader=train_loader,
+        val_loader=val_loader,
+        epochs=5,
+    )
+
+    # ---------------- EVALUATION ----------------
     evaluator = ModelEvaluator()
-    evaluator.evaluate_model(models[0], test_loader, 'SimpleCNN')
+    evaluator.evaluate_model(
+        model=models[0],
+        dataloader=val_loader,
+        model_name="SimpleCNN",
+    )
 
     print("\nQuick start completed!")
-
 
 def advanced_example():
     """Advanced example with custom configurations"""
@@ -780,7 +812,7 @@ if __name__ == '__main__':
     main()
 
     # Uncomment for quick start or advanced examples
-    #quick_start_example()
+    quick_start_example()
     # advanced_example()
 
     """

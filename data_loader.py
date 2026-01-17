@@ -15,6 +15,7 @@ import tarfile
 from sklearn.model_selection import train_test_split
 from enum import Enum
 import warnings
+from collections import defaultdict
 warnings.filterwarnings('ignore')
 
 try:
@@ -166,9 +167,8 @@ class SEN12MSCRExtractor:
 class SEN12MSCRDataset(Dataset):
     """
     PyTorch Dataset for SEN12MS-CR
-
-    Loads triplets of: S1 (SAR), S2 (clean), S2_cloudy
-    For cloud removal, we use: S2_cloudy as input, S2 as target
+    Input:  S2_cloudy (+ optional S1)
+    Target: S2 clean
     """
 
     def __init__(self, base_dir, seasons=None, s1_bands=None, s2_bands=None,
@@ -180,11 +180,12 @@ class SEN12MSCRDataset(Dataset):
             seasons: List of season names or 'all'. e.g., ['spring', 'winter']
             s1_bands: List of S1 band numbers [1,2] or None for all
             s2_bands: List of S2 band numbers [1-13] or None for all
-            split: 'train' or 'val'
+            split: 'train', 'val', or 'small'
             val_split: Validation split ratio (0.2 = 20%)
             random_state: Random seed for reproducibility
             transform: Optional transforms
             use_s1: If True, return (s1, s2_cloudy) as input
+            use_small: If True and split='small', use 10% of training data
         """
         if not RASTERIO_AVAILABLE:
             raise ImportError("rasterio required: pip install rasterio")
@@ -199,101 +200,134 @@ class SEN12MSCRDataset(Dataset):
         self.s2_bands = s2_bands if s2_bands else list(range(1, 14))
 
         # Parse seasons
-        if seasons is None or seasons == 'all':
-            self.seasons = [s.value for s in Seasons if s != Seasons.ALL]
+        if seasons is None or seasons == "all":
+            self.seasons = [
+                "ROIs1158_spring",
+                "ROIs1868_summer",
+                "ROIs1970_fall",
+                "ROIs2017_winter",
+            ]
         else:
-            # Convert to full names
             season_map = {
-                'spring': 'ROIs1158_spring',
-                'summer': 'ROIs1868_summer',
-                'fall': 'ROIs1970_fall',
-                'winter': 'ROIs2017_winter'
+                "spring": "ROIs1158_spring",
+                "summer": "ROIs1868_summer",
+                "fall": "ROIs1970_fall",
+                "winter": "ROIs2017_winter",
             }
             self.seasons = [season_map.get(s.lower(), s) for s in seasons]
 
-        # Collect all patch paths
-        print(f"\n{'='*60}")
-        print(f"Loading SEN12MS-CR Dataset - {split.upper()} Split")
-        print(f"{'='*60}")
-        print(f"Base directory: {self.base_dir}")
-        print(f"Seasons: {self.seasons}")
-        print(f"S2 bands: {self.s2_bands}")
-        if use_s1:
-            print(f"S1 bands: {self.s1_bands}")
+        print(f"\nLoading SEN12MS-CR [{split}]")
 
         self.samples = self._collect_samples()
 
-        # Split into train/val
+        # Split into train/val/small
         if len(self.samples) == 0:
-            raise ValueError("No samples found! Check sen12mscr_dataset structure.")
+            raise ValueError("No samples found! Check dataset structure.")
 
-        train_samples, val_samples = train_test_split(
-            self.samples,
-            test_size=val_split,
-            random_state=random_state
+        scenes = defaultdict(list)
+        for s in self.samples:
+            scenes[(s["season"], s["scene_id"])].append(s)
+
+        scene_keys = list(scenes.keys())
+        train_keys, val_keys = train_test_split(
+            scene_keys, test_size=val_split, random_state=random_state
         )
 
-        if split == 'train':
-            self.samples = train_samples
+        if split == "train":
+            selected_keys = train_keys
+        elif split == "val":
+            selected_keys = val_keys
+        elif split == "small":
+            small_keys, _ = train_test_split(
+                train_keys, test_size=0.9, random_state=random_state
+            )
+            selected_keys = small_keys
         else:
-            self.samples = val_samples
+            raise ValueError("split must be train / val / small")
 
-        print(f"Total samples: {len(self.samples)}")
-        print(f"{'='*60}\n")
+        self.samples = [
+            sample
+            for k in selected_keys
+            for sample in scenes[k]
+        ]
+
+        print(f"Samples in {split}: {len(self.samples)}")
 
     def _collect_samples(self):
-        """Collect all valid (s1, s2, s2_cloudy) triplets"""
+        """
+        Collect all valid (s1, s2, s2_cloudy) triplets
+
+        Expected structure:
+        sen12mscr_dataset/
+        ├── ROIsXXXX_season_s1/
+        │   └── s1_X/*.tif
+        ├── ROIsXXXX_season_s2/
+        │   └── s2_X/*.tif
+        └── ROIsXXXX_season_s2_cloudy/
+            └── s2_cloudy_X/*.tif
+        """
         samples = []
 
         for season in self.seasons:
-            season_path = self.base_dir / season
+            # Build directory paths based on actual structure
+            # Pattern: ROIsXXXX_season_sensor
+            s1_root = self.base_dir / f'{season}_s1'
+            s2_root = self.base_dir / f'{season}_s2'
+            s2cloudy_root = self.base_dir / f'{season}_s2_cloudy'
 
-            if not season_path.exists():
-                print(f"⚠ Season not found: {season}")
+            print(f"\nSearching in season: {season}")
+            print(f"  S1 dir: {s1_root} - {'✓ exists' if s1_root.exists() else '✗ missing'}")
+            print(f"  S2 dir: {s2_root} - {'✓ exists' if s2_root.exists() else '✗ missing'}")
+            print(f"  S2 cloudy dir: {s2cloudy_root} - {'✓ exists' if s2cloudy_root.exists() else '✗ missing'}")
+
+            if not s2_root.exists() or not s2cloudy_root.exists():
+                print(f"  ⚠ Skipping {season} - missing required directories")
                 continue
 
-            # Find all s2 scenes (these are the clean reference)
-            s2_scenes = sorted(season_path.glob('s2_*'))
-
-            for s2_scene_dir in s2_scenes:
+            for s2_scene_dir in sorted(s2_root.glob('s2_*')):
+                # Extract scene ID from directory name (s2_X -> X)
                 scene_id = s2_scene_dir.name.split('_')[1]
 
                 # Corresponding directories
-                s1_scene_dir = season_path / f's1_{scene_id}'
-                s2cloudy_scene_dir = season_path / f's2cloudy_{scene_id}'
+                s1_scene_dir = s1_root / f's1_{scene_id}'
+                s2cloudy_scene_dir = s2cloudy_root / f's2_cloudy_{scene_id}'
 
-                # Check if all three exist
-                if not s1_scene_dir.exists():
-                    continue
+                # S1 is optional, but s2_cloudy is required
                 if not s2cloudy_scene_dir.exists():
                     continue
 
-                # Get all patches in s2 (clean)
-                s2_patches = sorted(s2_scene_dir.glob('*.tif'))
-
-                for s2_patch_path in s2_patches:
+                for s2_patch_path in sorted(s2_scene_dir.glob('*.tif')):
                     # Extract patch filename
                     patch_filename = s2_patch_path.name
 
                     # Build corresponding paths
-                    # Patch filename format: ROIsXXXX_season_s2_X_pY.tif
+                    # Filename pattern: ROIsXXXX_season_s2_X_pY.tif
+                    # Need to convert to: ROIsXXXX_season_s1_X_pY.tif
                     s1_filename = patch_filename.replace('_s2_', '_s1_')
-                    s2cloudy_filename = patch_filename.replace('_s2_', '_s2cloudy_')
+                    s2cloudy_filename = patch_filename.replace('_s2_', '_s2_cloudy_')
 
-                    s1_path = s1_scene_dir / s1_filename
+                    # Full paths
+                    s1_path = s1_scene_dir / s1_filename if s1_scene_dir.exists() else None
                     s2cloudy_path = s2cloudy_scene_dir / s2cloudy_filename
 
-                    # Verify all exist
-                    if s1_path.exists() and s2cloudy_path.exists():
-                        samples.append({
-                            's1': s1_path,
-                            's2': s2_patch_path,
-                            's2_cloudy': s2cloudy_path,
-                            'season': season,
-                            'scene_id': scene_id
-                        })
+                    # Verify required files exist
+                    if not s2cloudy_path.exists():
+                        continue
 
-            print(f"  {season}: {len([s for s in samples if s['season'] == season])} patches")
+                    # S1 is optional
+                    if s1_path and not s1_path.exists():
+                        s1_path = None
+
+                    samples.append({
+                        's1': s1_path,
+                        's2': s2_patch_path,
+                        's2_cloudy': s2cloudy_path,
+                        'season': season,
+                        'scene_id': scene_id
+                    })
+
+            season_count = len([s for s in samples if s['season'] == season])
+            print(f"  → Collected {season_count} valid triplets from {season}")
 
         return samples
 
@@ -385,7 +419,7 @@ def visualize_sen12mscr_samples(dataset, n_samples=3, save_path='sen12mscr_sampl
     """Visualize sample triplets"""
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(n_samples, 3, figsize=(12, 4*n_samples))
+    fig, axes = plt.subplots(n_samples, 3, figsize=(12, 4 * n_samples))
     if n_samples == 1:
         axes = axes.reshape(1, -1)
 
@@ -403,8 +437,8 @@ def visualize_sen12mscr_samples(dataset, n_samples=3, save_path='sen12mscr_sampl
         # Take RGB bands (B04=Red, B03=Green, B02=Blue = bands 4,3,2 = indices 3,2,1)
         # Assuming full 13 bands, RGB are at indices [3,2,1]
         if s2_cloudy.shape[0] >= 13:
-            cloudy_rgb = s2_cloudy[[3,2,1]].permute(1, 2, 0).numpy()
-            clean_rgb = s2[[3,2,1]].permute(1, 2, 0).numpy()
+            cloudy_rgb = s2_cloudy[[3, 2, 1]].permute(1, 2, 0).numpy()
+            clean_rgb = s2[[3, 2, 1]].permute(1, 2, 0).numpy()
         elif s2_cloudy.shape[0] >= 3:
             cloudy_rgb = s2_cloudy[:3].permute(1, 2, 0).numpy()
             clean_rgb = s2[:3].permute(1, 2, 0).numpy()
@@ -413,21 +447,21 @@ def visualize_sen12mscr_samples(dataset, n_samples=3, save_path='sen12mscr_sampl
             clean_rgb = s2[0].numpy()
 
         axes[i, 0].imshow(np.clip(cloudy_rgb, 0, 1))
-        axes[i, 0].set_title(f'Sample {i+1}: S2 Cloudy')
+        axes[i, 0].set_title(f'Sample {i + 1}: S2 Cloudy')
         axes[i, 0].axis('off')
 
         axes[i, 1].imshow(np.clip(clean_rgb, 0, 1))
-        axes[i, 1].set_title(f'Sample {i+1}: S2 Clean')
+        axes[i, 1].set_title(f'Sample {i + 1}: S2 Clean')
         axes[i, 1].axis('off')
 
         if s1 is not None:
             s1_img = s1[0].numpy()
             axes[i, 2].imshow(s1_img, cmap='gray')
-            axes[i, 2].set_title(f'Sample {i+1}: S1 SAR (VV)')
+            axes[i, 2].set_title(f'Sample {i + 1}: S1 SAR (VV)')
         else:
             diff = np.abs(cloudy_rgb - clean_rgb)
             axes[i, 2].imshow(diff)
-            axes[i, 2].set_title(f'Sample {i+1}: Difference')
+            axes[i, 2].set_title(f'Sample {i + 1}: Difference')
 
         axes[i, 2].axis('off')
 
@@ -450,10 +484,10 @@ if __name__ == '__main__':
 
     print("\nWhat would you like to do?")
     print("1. Extract tar files")
-    print("2. Verify sen12mscr_dataset structure")
-    print("3. Test sen12mscr_dataset loading")
+    print("2. Verify dataset structure")
+    print("3. Test dataset loading")
     print("4. Visualize samples")
-    print("5. Show sen12mscr_dataset statistics")
+    print("5. Show dataset statistics")
     print("6. Exit")
 
     choice = input("\nEnter choice (1-6): ").strip()
@@ -468,7 +502,7 @@ if __name__ == '__main__':
 
         tar_files = []
         while True:
-            path = input(f"  Tar file {len(tar_files)+1}: ").strip()
+            path = input(f"  Tar file {len(tar_files) + 1}: ").strip()
             if not path:
                 break
             if Path(path).exists():
@@ -493,7 +527,7 @@ if __name__ == '__main__':
             print(f"  Found {len(found)} season(s)")
 
     elif choice == '3':
-        print("\nTesting sen12mscr_dataset loading...")
+        print("\nTesting dataset loading...")
         print("Which seasons do you have? (comma-separated, or 'all')")
         print("Available: winter, spring, summer, fall")
 
@@ -542,6 +576,7 @@ if __name__ == '__main__':
         except Exception as e:
             print(f"\n✗ Error: {e}")
             import traceback
+
             traceback.print_exc()
 
     elif choice == '4':
@@ -565,14 +600,14 @@ if __name__ == '__main__':
 
     elif choice == '5':
         print("\nDataset Statistics")
-        print("="*70)
+        print("=" * 70)
 
         extractor = SEN12MSCRExtractor('./sen12mscr_dataset')
         found_seasons = extractor.verify_structure()
 
         if found_seasons:
             print(f"\nTotal seasons found: {len(found_seasons)}")
-            print("\nTo get full statistics, load the sen12mscr_dataset with option 3")
+            print("\nTo get full statistics, load the dataset with option 3")
 
     else:
         print("Exiting...")
