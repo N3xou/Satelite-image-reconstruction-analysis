@@ -119,7 +119,7 @@ class SEN12MSCRExtractor:
         return extracted_seasons
 
     def verify_structure(self):
-        """Verify the extracted dataset structure"""
+        """Verify the extracted sen12mscr_dataset structure"""
         print("\n" + "="*70)
         print("VERIFYING DATASET STRUCTURE")
         print("="*70)
@@ -225,7 +225,7 @@ class SEN12MSCRDataset(Dataset):
 
         # Split into train/val
         if len(self.samples) == 0:
-            raise ValueError("No samples found! Check dataset structure.")
+            raise ValueError("No samples found! Check sen12mscr_dataset structure.")
 
         train_samples, val_samples = train_test_split(
             self.samples,
@@ -450,10 +450,10 @@ if __name__ == '__main__':
 
     print("\nWhat would you like to do?")
     print("1. Extract tar files")
-    print("2. Verify dataset structure")
-    print("3. Test dataset loading")
+    print("2. Verify sen12mscr_dataset structure")
+    print("3. Test sen12mscr_dataset loading")
     print("4. Visualize samples")
-    print("5. Show dataset statistics")
+    print("5. Show sen12mscr_dataset statistics")
     print("6. Exit")
 
     choice = input("\nEnter choice (1-6): ").strip()
@@ -493,7 +493,7 @@ if __name__ == '__main__':
             print(f"  Found {len(found)} season(s)")
 
     elif choice == '3':
-        print("\nTesting dataset loading...")
+        print("\nTesting sen12mscr_dataset loading...")
         print("Which seasons do you have? (comma-separated, or 'all')")
         print("Available: winter, spring, summer, fall")
 
@@ -572,7 +572,7 @@ if __name__ == '__main__':
 
         if found_seasons:
             print(f"\nTotal seasons found: {len(found_seasons)}")
-            print("\nTo get full statistics, load the dataset with option 3")
+            print("\nTo get full statistics, load the sen12mscr_dataset with option 3")
 
     else:
         print("Exiting...")

@@ -41,7 +41,7 @@ class SatelliteDataset(Dataset):
         self.cache = {}
         self.cache_size = cache_size
 
-        # Preload all data to RAM if dataset is small (CPU bottleneck fix #1)
+        # Preload all data to RAM if sen12mscr_dataset is small (CPU bottleneck fix #1)
         if preload and len(self.files) <= cache_size:
             print(f"Preloading {len(self.files)} images to RAM...")
             for idx in range(len(self.files)):
@@ -83,13 +83,13 @@ class SatelliteDataset(Dataset):
 # ==================== 2. DATA EXPLORATION & INSIGHTS ====================
 
 class DataExplorer:
-    """Generate insights about the satellite dataset"""
+    """Generate insights about the satellite sen12mscr_dataset"""
 
     def __init__(self, dataset):
         self.dataset = dataset
 
     def analyze_dataset(self):
-        """Comprehensive dataset analysis"""
+        """Comprehensive sen12mscr_dataset analysis"""
         print("\n" + "="*60)
         print("DATASET ANALYSIS")
         print("="*60)
@@ -109,7 +109,7 @@ class DataExplorer:
         self._visualize_samples()
 
     def _compute_statistics(self):
-        """Compute dataset statistics"""
+        """Compute sen12mscr_dataset statistics"""
         all_clean = []
         all_cloudy = []
 
@@ -388,16 +388,16 @@ def main():
     print("SATELLITE CLOUD REMOVAL - ML/DL COMPARISON PROJECT")
     print("=" * 60)
 
-    # Choose dataset type
+    # Choose sen12mscr_dataset type
     print("\n### STEP 0: Dataset Selection ###")
-    print("\nChoose your dataset:")
+    print("\nChoose your sen12mscr_dataset:")
     print("1. Synthetic data (quick test, ~100 samples)")
-    print("2. SEN12MS-CR dataset (real data, spring + winter)")
+    print("2. SEN12MS-CR sen12mscr_dataset (real data, spring + winter)")
 
     choice = input("\nEnter choice (1-2, or press Enter for synthetic): ").strip()
 
     if choice == '2':
-        # Use SEN12MS-CR dataset
+        # Use SEN12MS-CR sen12mscr_dataset
         try:
             import sys
             # Try to import from sen12mscr_dataset.py
@@ -412,7 +412,7 @@ def main():
                 dataset_path = Path('./sen12mscr_dataset/organized')
 
                 if not dataset_path.exists():
-                    print("\n⚠ SEN12MS-CR organized dataset not found!")
+                    print("\n⚠ SEN12MS-CR organized sen12mscr_dataset not found!")
                     print("\nSetup required:")
                     print("1. Place your tar files in current directory:")
                     print("   - ROIs1158_spring_s1.tar")
@@ -424,7 +424,7 @@ def main():
                     print("\nUsing synthetic data instead...")
                     choice = '1'
                 else:
-                    print(f"\n✓ Loading SEN12MS-CR dataset from {dataset_path}")
+                    print(f"\n✓ Loading SEN12MS-CR sen12mscr_dataset from {dataset_path}")
 
                     # Ask about bands
                     print("\nSelect bands to use:")
@@ -445,13 +445,13 @@ def main():
                         bands = [2, 3, 4, 8]  # Default: Blue, Green, Red, NIR
                         print("Using RGB + NIR (4 bands)")
 
-                    # Load dataset
+                    # Load sen12mscr_dataset
                     train_dataset = SEN12MSCRDataset(
                         dataset_path,
                         split='train',
                         bands=bands,
                         use_s1=False,  # Not using SAR for now
-                        preload=False  # Don't preload large dataset
+                        preload=False  # Don't preload large sen12mscr_dataset
                     )
 
                     val_dataset = SEN12MSCRDataset(
@@ -462,7 +462,7 @@ def main():
                         preload=False
                     )
 
-                    # Create test dataset from validation
+                    # Create test sen12mscr_dataset from validation
                     test_dataset = val_dataset
 
                     print(f"\nDataset loaded successfully!")
@@ -471,7 +471,7 @@ def main():
                     print(f"Bands: {len(bands)}")
 
         except Exception as e:
-            print(f"\n✗ Error loading SEN12MS-CR dataset: {e}")
+            print(f"\n✗ Error loading SEN12MS-CR sen12mscr_dataset: {e}")
             print("Using synthetic data instead...")
             choice = '1'
 
@@ -480,10 +480,10 @@ def main():
     # Train Models with K-Fold
     print("\n### STEP 3: Model Training with K-Fold CV ###")
 
-    # Adjust settings based on dataset
+    # Adjust settings based on sen12mscr_dataset
     if choice == '2':
-        # SEN12MS-CR: Large dataset, adjust parameters
-        print("\n⚙ Optimized settings for SEN12MS-CR dataset")
+        # SEN12MS-CR: Large sen12mscr_dataset, adjust parameters
+        print("\n⚙ Optimized settings for SEN12MS-CR sen12mscr_dataset")
         k_folds = 3
         epochs = 30
         batch_size = 4
@@ -493,7 +493,7 @@ def main():
         input_channels = len(bands) if choice == '2' else 4
         print(f"Model input channels: {input_channels}")
     else:
-        # Synthetic: Small dataset
+        # Synthetic: Small sen12mscr_dataset
         k_folds = 3
         epochs = 30
         batch_size = 4
@@ -569,14 +569,14 @@ def main():
 
     # Dataset-specific notes
     if choice == '2':
-        print("\n✓ Trained on SEN12MS-CR dataset (real Sentinel-2 data)")
+        print("\n✓ Trained on SEN12MS-CR sen12mscr_dataset (real Sentinel-2 data)")
         print(f"  - Training samples: {len(train_dataset)}")
         print(f"  - Validation samples: {len(val_dataset)}")
         print(f"  - Spectral bands: {len(bands)}")
         print(f"  - Seasons: Spring + Winter")
     else:
         print("\n📝 Note: You used synthetic data. For better results:")
-        print("   1. Download SEN12MS-CR dataset from TUM")
+        print("   1. Download SEN12MS-CR sen12mscr_dataset from TUM")
         print("   2. Extract tar files to current directory")
         print("   3. Run: python sen12mscr_dataset.py (option 1)")
         print("   4. Run this script again and choose option 2")
@@ -705,7 +705,7 @@ class TemporalDataGenerator:
         self.sequence_length = sequence_length
 
     def create_sequences(self):
-        """Create temporal sequences from dataset"""
+        """Create temporal sequences from sen12mscr_dataset"""
         sequences = []
 
         for i in range(len(self.base_dataset) - self.sequence_length):
@@ -725,14 +725,14 @@ class TemporalDataGenerator:
 # ==================== USAGE EXAMPLES ====================
 
 def quick_start_example():
-    """Quick start example with minimal dataset"""
+    """Quick start example with minimal sen12mscr_dataset"""
     print("\n### QUICK START EXAMPLE ###\n")
 
-    # Create small dataset
+    # Create small sen12mscr_dataset
     preparer = SatelliteDatasetPreparer('./quick_test')
     clean_dir, cloudy_dir = preparer.create_synthetic_dataset(n_samples=20)
 
-    # Load dataset
+    # Load sen12mscr_dataset
     dataset = SatelliteDataset(clean_dir, cloudy_dir)
 
     # Train single model
@@ -767,7 +767,7 @@ def advanced_example():
         print(f"  {key}: {value}")
 
     print("\nTo run advanced example:")
-    print("1. Increase dataset size and image resolution")
+    print("1. Increase sen12mscr_dataset size and image resolution")
     print("2. Use all 13 Sentinel-2 bands")
     print("3. Train longer with more folds")
     print("4. Implement data augmentation")

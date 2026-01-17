@@ -1,5 +1,5 @@
 class SatelliteDatasetPreparer:
-    """Handles dataset acquisition and cloud simulation"""
+    """Handles sen12mscr_dataset acquisition and cloud simulation"""
 
     def __init__(self, data_dir='./satellite_data'):
         self.data_dir = Path(data_dir)

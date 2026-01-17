@@ -456,7 +456,7 @@ def example_2_load_and_train():
     """
     print("\n=== EXAMPLE 2: Load and Train ===\n")
 
-    # Load dataset
+    # Load sen12mscr_dataset
     dataset = Sentinel2Dataset(
         data_dir='./sentinel2_data',
         bands=[2, 3, 4, 8],  # Blue, Green, Red, NIR
