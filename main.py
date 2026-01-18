@@ -14,7 +14,7 @@ from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from synthetic_data_generator import SatelliteDatasetPreparer
 import warnings
-
+from data_loader import SEN12MSCRDataset
 from training_functions import ModelTrainer
 warnings.filterwarnings('ignore')
 
@@ -25,59 +25,6 @@ try:
 except ImportError:
     RASTERIO_AVAILABLE = False
     print("Note: rasterio not installed. Install for real Sentinel-2 data: pip install rasterio")
-
-# ==================== 1. DATA ACQUISITION & PREPARATION ===================
-
-
-class SatelliteDataset(Dataset):
-    """PyTorch Dataset for satellite image pairs"""
-
-    def __init__(self, clean_dir, cloudy_dir, transform=None, preload=True, cache_size=50):
-        self.clean_dir = Path(clean_dir)
-        self.cloudy_dir = Path(cloudy_dir)
-        self.files = sorted(list(self.clean_dir.glob('*.npy')))
-        self.transform = transform
-        self.preload = preload
-        self.cache = {}
-        self.cache_size = cache_size
-
-        # Preload all data to RAM if sen12mscr_dataset is small (CPU bottleneck fix #1)
-        if preload and len(self.files) <= cache_size:
-            print(f"Preloading {len(self.files)} images to RAM...")
-            for idx in range(len(self.files)):
-                self.cache[idx] = self._load_from_disk(idx)
-            print("Preloading complete!")
-
-    def _load_from_disk(self, idx):
-        """Load image pair from disk"""
-        clean_path = self.files[idx]
-        cloudy_path = self.cloudy_dir / clean_path.name
-
-        clean = torch.from_numpy(np.load(clean_path))
-        cloudy = torch.from_numpy(np.load(cloudy_path))
-
-        if self.transform:
-            clean = self.transform(clean)
-            cloudy = self.transform(cloudy)
-
-        return cloudy, clean
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        # Use cached data if available (CPU bottleneck fix #2)
-        if idx in self.cache:
-            return self.cache[idx]
-
-        # Load from disk
-        data = self._load_from_disk(idx)
-
-        # Cache if within cache size
-        if len(self.cache) < self.cache_size:
-            self.cache[idx] = data
-
-        return data
 
 
 # ==================== 2. DATA EXPLORATION & INSIGHTS ====================
