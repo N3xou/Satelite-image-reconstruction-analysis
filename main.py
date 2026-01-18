@@ -10,12 +10,15 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 import torch
+from sklearn.model_selection import train_test_split
+from collections import defaultdict
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from synthetic_data_generator import SatelliteDatasetPreparer
 import warnings
 from data_loader import SEN12MSCRDataset
 from training_functions import ModelTrainer
+import time
 warnings.filterwarnings('ignore')
 
 # Try to import rasterio (optional, needed only for real Sentinel-2 data)
@@ -26,6 +29,29 @@ except ImportError:
     RASTERIO_AVAILABLE = False
     print("Note: rasterio not installed. Install for real Sentinel-2 data: pip install rasterio")
 
+class Config:
+    # Dataset
+    DATASET_ROOT = "./sen12mscr_dataset"
+    SEASONS = None  # None = all seasons
+    S2_BANDS = [2, 3, 4, 8]  # RGB + NIR (Blue, Green, Red, NIR)
+    PATCH_SIZE = 256
+    DATA_FRACTION = 0.05  # Use 5% of data for quick training
+
+    # Training
+    BATCH_SIZE = 4
+    EPOCHS = 3
+    LEARNING_RATE = 0.001
+    PATIENCE = 7
+    USE_AMP = True  # Automatic Mixed Precision
+    NUM_WORKERS = 4
+
+    # Models to train
+    MODELS = ['SimpleCNN', 'UNet', 'GAN']  # Fast models for demo
+    # MODELS = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']  # All models
+
+    # Output
+    OUTPUT_DIR = Path("./results")
+    SAVE_MODELS = True
 
 # ==================== 2. DATA EXPLORATION & INSIGHTS ====================
 
@@ -126,36 +152,37 @@ class DataExplorer:
 # ==================== 5. EVALUATION & COMPARISON ====================
 
 class ModelEvaluator:
-    """Evaluate and compare model performance"""
+    """Comprehensive model evaluation"""
 
     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.device = device
         self.results = {}
-        self.timing_results = {}  # Store timing information
 
     def evaluate_model(self, model, test_loader, model_name):
-        """Evaluate single model"""
-        import time
-
+        """Evaluate single model with comprehensive metrics"""
         model.eval()
 
         all_preds = []
         all_targets = []
         inference_times = []
 
-        with torch.no_grad():
-            for cloudy, clean in test_loader:
-                cloudy = cloudy.to(self.device, non_blocking=True)
+        print(f"\nEvaluating {model_name}...")
 
+        with torch.no_grad():
+            for batch_idx, (s1, s2_cloudy, s2_clean, cloud_mask) in enumerate(test_loader):
+                s2_cloudy = s2_cloudy.to(self.device, non_blocking=True)
+                s2_clean = s2_clean.to(self.device, non_blocking=True)
+
+                # Handle LSTM special input
                 if 'LSTM' in model_name:
-                    cloudy = cloudy.unsqueeze(1)
+                    s2_cloudy = s2_cloudy.unsqueeze(1)
 
                 # Measure inference time
                 if self.device == 'cuda':
                     torch.cuda.synchronize()
                 start_time = time.time()
 
-                output = model(cloudy)
+                output = model(s2_cloudy)
 
                 if self.device == 'cuda':
                     torch.cuda.synchronize()
@@ -163,627 +190,491 @@ class ModelEvaluator:
                 inference_times.append(inference_time)
 
                 all_preds.append(output.cpu().numpy())
-                all_targets.append(clean.numpy())
+                all_targets.append(s2_clean.cpu().numpy())
 
         preds = np.concatenate(all_preds, axis=0)
         targets = np.concatenate(all_targets, axis=0)
 
         # Calculate metrics
+        metrics = self._calculate_metrics(targets, preds, inference_times)
+        self.results[model_name] = metrics
+
+        # Print results
+        print(f"\n{model_name} Results:")
+        print("-" * 50)
+        for metric, value in metrics.items():
+            print(f"  {metric:.<30} {value:.6f}")
+
+        return metrics
+
+    def _calculate_metrics(self, targets, preds, inference_times):
+        """Calculate all evaluation metrics"""
+        # Basic metrics
         mse = mean_squared_error(targets.flatten(), preds.flatten())
         mae = mean_absolute_error(targets.flatten(), preds.flatten())
         rmse = np.sqrt(mse)
 
         # PSNR
-        psnr_scores = []
-        for i in range(len(preds)):
-            psnr = self._calculate_psnr(targets[i], preds[i])
-            psnr_scores.append(psnr)
-
+        psnr_scores = [self._psnr(targets[i], preds[i]) for i in range(len(preds))]
         psnr = np.mean(psnr_scores)
 
-        # SSIM (simplified version)
-        ssim = self._calculate_ssim(targets, preds)
+        # SSIM (simplified)
+        ssim = self._ssim(targets, preds)
 
-        # Timing statistics
-        avg_inference_time = np.mean(inference_times)
-        total_inference_time = np.sum(inference_times)
-        images_per_second = len(preds) / total_inference_time
+        # Timing
+        avg_inference = np.mean(inference_times)
+        throughput = len(preds) / np.sum(inference_times)
 
-        metrics = {
+        return {
             'MSE': mse,
             'MAE': mae,
             'RMSE': rmse,
-            'PSNR': psnr,
+            'PSNR_dB': psnr,
             'SSIM': ssim,
-            'Avg_Inference_Time': avg_inference_time,
-            'Images_Per_Second': images_per_second
+            'Inference_Time_s': avg_inference,
+            'Throughput_img_s': throughput
         }
 
-        self.results[model_name] = metrics
-
-        print(f"\n{model_name} Results:")
-        print("-" * 40)
-        for metric, value in metrics.items():
-            if 'Time' in metric or 'Second' in metric:
-                print(f"{metric}: {value:.4f}")
-            else:
-                print(f"{metric}: {value:.6f}")
-
-        return metrics
-
-    def _calculate_psnr(self, target, pred, max_val=1.0):
-        """Calculate Peak Signal-to-Noise Ratio"""
+    @staticmethod
+    def _psnr(target, pred, max_val=1.0):
+        """Peak Signal-to-Noise Ratio"""
         mse = np.mean((target - pred) ** 2)
         if mse == 0:
-            return float('inf')
+            return 100.0
         return 20 * np.log10(max_val / np.sqrt(mse))
 
-    def _calculate_ssim(self, targets, preds):
-        """Simplified SSIM calculation"""
-        # Simplified version - full SSIM requires more complex windowing
-        c1 = 0.01 ** 2
-        c2 = 0.03 ** 2
-
-        mu_x = np.mean(targets)
-        mu_y = np.mean(preds)
-        sigma_x = np.std(targets)
-        sigma_y = np.std(preds)
+    @staticmethod
+    def _ssim(targets, preds):
+        """Simplified Structural Similarity Index"""
+        c1, c2 = 0.01 ** 2, 0.03 ** 2
+        mu_x, mu_y = np.mean(targets), np.mean(preds)
+        sigma_x, sigma_y = np.std(targets), np.std(preds)
         sigma_xy = np.mean((targets - mu_x) * (preds - mu_y))
 
         ssim = ((2 * mu_x * mu_y + c1) * (2 * sigma_xy + c2)) / \
-               ((mu_x**2 + mu_y**2 + c1) * (sigma_x**2 + sigma_y**2 + c2))
-
+               ((mu_x ** 2 + mu_y ** 2 + c1) * (sigma_x ** 2 + sigma_y ** 2 + c2))
         return ssim
 
-    def compare_models(self, training_times=None):
-        """Generate comparison visualizations including training time"""
-        if not self.results:
-            print("No results to compare")
-            return
-
+    def generate_comparison_report(self, training_times, output_dir):
+        """Generate comprehensive comparison visualizations"""
         df = pd.DataFrame(self.results).T
 
-        # Add training times if provided
-        if training_times:
-            df['Training_Time_Minutes'] = [training_times.get(model, 0) / 60
-                                           for model in df.index]
+        # Add training times
+        df['Training_Time_min'] = [training_times.get(m, 0) / 60 for m in df.index]
 
-        print("\n" + "="*60)
+        # Save CSV
+        csv_path = output_dir / 'model_comparison.csv'
+        df.to_csv(csv_path)
+        print(f"\n✓ Saved comparison CSV: {csv_path}")
+
+        # Print summary
+        print("\n" + "=" * 70)
         print("MODEL COMPARISON SUMMARY")
-        print("="*60)
+        print("=" * 70)
         print(df.to_string())
+        print("=" * 70)
 
-        # Plot comparison with training time
-        n_metrics = len(df.columns)
-        n_cols = 3
-        n_rows = (n_metrics + n_cols - 1) // n_cols
+        # Generate plots
+        self._plot_metrics_comparison(df, output_dir)
+        self._plot_training_efficiency(df, output_dir)
 
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5*n_rows))
-        axes = axes.flatten() if n_rows > 1 else [axes] if n_cols == 1 else axes
+        # Best model analysis
+        self._print_best_models(df)
 
-        metrics = list(df.columns)
-        colors = ['skyblue', 'lightcoral', 'lightgreen', 'lightyellow', 'lightpink']
+        return df
+
+    def _plot_metrics_comparison(self, df, output_dir):
+        """Plot all metrics comparison"""
+        metrics = ['MSE', 'MAE', 'RMSE', 'PSNR_dB', 'SSIM',
+                   'Inference_Time_s', 'Throughput_img_s', 'Training_Time_min']
+
+        fig, axes = plt.subplots(3, 3, figsize=(18, 12))
+        axes = axes.flatten()
+
+        colors = plt.cm.Set3(range(len(df)))
 
         for i, metric in enumerate(metrics):
-            if i < len(axes):
-                df[metric].plot(kind='bar', ax=axes[i], color=colors[:len(df)])
-                axes[i].set_title(f'{metric} Comparison', fontsize=12, fontweight='bold')
-                axes[i].set_ylabel(metric)
-                axes[i].tick_params(axis='x', rotation=45)
-                axes[i].grid(axis='y', alpha=0.3)
+            if i < len(axes) and metric in df.columns:
+                ax = axes[i]
+                df[metric].plot(kind='bar', ax=ax, color=colors)
+                ax.set_title(f'{metric}', fontsize=14, fontweight='bold')
+                ax.set_ylabel(metric, fontsize=11)
+                ax.tick_params(axis='x', rotation=45)
+                ax.grid(axis='y', alpha=0.3)
 
         # Hide unused subplots
         for i in range(len(metrics), len(axes)):
             axes[i].axis('off')
 
         plt.tight_layout()
-        plt.savefig('model_comparison.png', dpi=300, bbox_inches='tight')
+        plot_path = output_dir / 'metrics_comparison.png'
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
         plt.close()
+        print(f"✓ Saved metrics plot: {plot_path}")
 
-        # Create training time vs quality plot
-        if training_times:
-            fig, ax = plt.subplots(figsize=(10, 6))
+    def _plot_training_efficiency(self, df, output_dir):
+        """Plot training time vs quality"""
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
 
-            train_times = [training_times.get(model, 0) / 60 for model in df.index]
-            psnr_values = df['PSNR'].values
+        # Training time vs PSNR
+        ax1.scatter(df['Training_Time_min'], df['PSNR_dB'],
+                    s=200, alpha=0.6, c=range(len(df)), cmap='viridis')
+        for i, model in enumerate(df.index):
+            ax1.annotate(model,
+                         (df.loc[model, 'Training_Time_min'], df.loc[model, 'PSNR_dB']),
+                         xytext=(5, 5), textcoords='offset points', fontsize=10)
+        ax1.set_xlabel('Training Time (minutes)', fontsize=12, fontweight='bold')
+        ax1.set_ylabel('PSNR (dB)', fontsize=12, fontweight='bold')
+        ax1.set_title('Training Efficiency', fontsize=14, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
 
-            ax.scatter(train_times, psnr_values, s=200, alpha=0.6, c=range(len(df)), cmap='viridis')
+        # Inference time vs PSNR
+        ax2.scatter(df['Inference_Time_s'] * 1000, df['PSNR_dB'],
+                    s=200, alpha=0.6, c=range(len(df)), cmap='plasma')
+        for i, model in enumerate(df.index):
+            ax2.annotate(model,
+                         (df.loc[model, 'Inference_Time_s'] * 1000, df.loc[model, 'PSNR_dB']),
+                         xytext=(5, 5), textcoords='offset points', fontsize=10)
+        ax2.set_xlabel('Inference Time (ms)', fontsize=12, fontweight='bold')
+        ax2.set_ylabel('PSNR (dB)', fontsize=12, fontweight='bold')
+        ax2.set_title('Inference Efficiency', fontsize=14, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
 
-            for i, model in enumerate(df.index):
-                ax.annotate(model, (train_times[i], psnr_values[i]),
-                           xytext=(5, 5), textcoords='offset points',
-                           fontsize=10, fontweight='bold')
+        plt.tight_layout()
+        plot_path = output_dir / 'efficiency_analysis.png'
+        plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✓ Saved efficiency plot: {plot_path}")
 
-            ax.set_xlabel('Training Time (minutes)', fontsize=12, fontweight='bold')
-            ax.set_ylabel('PSNR (dB)', fontsize=12, fontweight='bold')
-            ax.set_title('Training Time vs Quality', fontsize=14, fontweight='bold')
-            ax.grid(True, alpha=0.3)
-
-            plt.tight_layout()
-            plt.savefig('time_vs_quality.png', dpi=300, bbox_inches='tight')
-            plt.close()
-
-            print("\nTime vs Quality plot saved to: time_vs_quality.png")
-
-        print("\nComparison saved to: model_comparison.png")
-
-        # Best model analysis
-        best_psnr_model = df['PSNR'].idxmax()
-        best_speed_model = df['Images_Per_Second'].idxmax()
-
-        print(f"\n{'='*60}")
+    def _print_best_models(self, df):
+        """Print best model analysis"""
+        print(f"\n{'=' * 70}")
         print("BEST MODEL ANALYSIS")
-        print(f"{'='*60}")
-        print(f"Best Quality (PSNR): {best_psnr_model} ({df.loc[best_psnr_model, 'PSNR']:.2f} dB)")
-        print(f"Fastest Inference: {best_speed_model} ({df.loc[best_speed_model, 'Images_Per_Second']:.2f} img/s)")
+        print(f"{'=' * 70}")
 
-        if training_times:
-            fastest_training = df['Training_Time_Minutes'].idxmin()
-            print(f"Fastest Training: {fastest_training} ({df.loc[fastest_training, 'Training_Time_Minutes']:.2f} min)")
+        best_quality = df['PSNR_dB'].idxmax()
+        best_speed = df['Throughput_img_s'].idxmax()
+        fastest_train = df['Training_Time_min'].idxmin()
 
-        print(f"{'='*60}")
-
-        return df
-
-
-# ==================== MAIN EXECUTION ====================
-
-def main():
-    """Main execution pipeline"""
-
-    print("=" * 60)
-    print("SATELLITE CLOUD REMOVAL - ML/DL COMPARISON PROJECT")
-    print("=" * 60)
-
-    # Choose sen12mscr_dataset type
-    print("\n### STEP 0: Dataset Selection ###")
-    print("\nChoose your sen12mscr_dataset:")
-    print("2. SEN12MS-CR sen12mscr_dataset (real data, spring + winter)")
-
-    choice = input("\nEnter choice (1-2, or press Enter for synthetic): ").strip()
-
-    if choice == '2':
-        # Use SEN12MS-CR sen12mscr_dataset
-        try:
-            import sys
-            # Try to import from sen12mscr_dataset.py
-            try:
-                from sen12mscr_dataset import SEN12MSCRDataset
-            except ImportError:
-                print("\n⚠ sen12mscr_dataset.py not found in current directory")
-                print("Please ensure sen12mscr_dataset.py is in the same folder")
-
-            if choice == '2':
-                dataset_path = Path('./sen12mscr_dataset/')
-
-                if not dataset_path.exists():
-                    print("\n⚠ SEN12MS-CR organized sen12mscr_dataset not found!")
-                    print("\nSetup required:")
-                    print("1. Place your tar files in current directory:")
-                    print("   - ROIs1158_spring_s1.tar")
-                    print("   - ROIs1158_spring_s2_cloudy.tar")
-                    print("   - ROIs2017_winter_s1.tar")
-                    print("   - ROIs2017_winter_s2_cloudy.tar")
-                    print("\n2. Run: python sen12mscr_dataset.py")
-                    print("3. Choose option 1: Extract and organize")
-                    print("\nUsing synthetic data instead...")
-                    choice = '1'
-                else:
-                    print(f"\n✓ Loading SEN12MS-CR sen12mscr_dataset from {dataset_path}")
-
-                    # Ask about bands
-                    print("\nSelect bands to use:")
-                    print("1. RGB + NIR (bands 2,3,4,8 - recommended, fastest)")
-                    print("2. All 13 bands (complete Sentinel-2, slower)")
-                    print("3. Custom bands")
-
-                    band_choice = input("Enter choice (1-3): ").strip()
-
-                    if band_choice == '2':
-                        bands = list(range(1, 14))  # All bands
-                        print("Using all 13 Sentinel-2 bands")
-                    elif band_choice == '3':
-                        bands_input = input("Enter band numbers (e.g., 2,3,4,8): ")
-                        bands = [int(b.strip()) for b in bands_input.split(',')]
-                        print(f"Using bands: {bands}")
-                    else:
-                        bands = [2, 3, 4, 8]  # Default: Blue, Green, Red, NIR
-                        print("Using RGB + NIR (4 bands)")
-
-                    # Load sen12mscr_dataset
-                    train_dataset = SEN12MSCRDataset(
-                        seasons=None, s1_bands=None, s2_bands=None,
-                        split='small', val_split=0.2, random_state=42,
-                        transform=None, use_s1=False # Don't preload large sen12mscr_dataset
-                    )
-
-                    val_dataset = SEN12MSCRDataset(
-                        dataset_path,
-                        split='val',
-                        bands=bands,
-                        use_s1=False,
-                        preload=False
-                    )
-
-                    # Create test sen12mscr_dataset from validation
-                    test_dataset = val_dataset
-
-                    print(f"\nDataset loaded successfully!")
-                    print(f"Training samples: {len(train_dataset)}")
-                    print(f"Validation samples: {len(val_dataset)}")
-                    print(f"Bands: {len(bands)}")
-
-        except Exception as e:
-            print(f"\n✗ Error loading SEN12MS-CR sen12mscr_dataset: {e}")
-            print("Using synthetic data instead...")
-            choice = '1'
-
-    test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False)
-
-    # Train Models with K-Fold
-    print("\n### STEP 3: Model Training with K-Fold CV ###")
-
-    # Adjust settings based on sen12mscr_dataset
-    if choice == '2':
-        # SEN12MS-CR: Large sen12mscr_dataset, adjust parameters
-        print("\n⚙ Optimized settings for SEN12MS-CR sen12mscr_dataset")
-        k_folds = 3
-        epochs = 30
-        batch_size = 4
-        patience = 7
-
-        # Adjust input channels based on bands
-        input_channels = len(bands) if choice == '2' else 4
-        print(f"Model input channels: {input_channels}")
-    else:
-        # Synthetic: Small sen12mscr_dataset
-        k_folds = 3
-        epochs = 30
-        batch_size = 4
-        patience = 5
-        input_channels = 4
-
-    # Ask which models to train
-    print("\nWhich models would you like to train?")
-    print("1. All models (SimpleCNN, UNet, GAN, LSTM, Diffusion)")
-    print("2. Fast models only (SimpleCNN, UNet)")
-    print("3. Best models only (UNet, GAN)")
-    print("4. Single model (choose one)")
-
-    model_choice = input("Enter choice (1-4): ").strip()
-
-    if model_choice == '2':
-        model_types = ['SimpleCNN', 'UNet']
-    elif model_choice == '3':
-        model_types = ['UNet', 'GAN']
-    elif model_choice == '4':
-        print("\nAvailable models:")
-        print("1. SimpleCNN  2. UNet  3. GAN  4. LSTM  5. Diffusion")
-        single = input("Enter number: ").strip()
-        model_map = {'1': 'SimpleCNN', '2': 'UNet', '3': 'GAN',
-                     '4': 'LSTM', '5': 'Diffusion'}
-        model_types = [model_map.get(single, 'UNet')]
-    else:
-        model_types = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']
-
-    print(f"\nTraining models: {', '.join(model_types)}")
-
-    trained_models = {}
-    training_times = {}
-
-    for model_type in model_types:
-        trainer = ModelTrainer(model_type)
-        models, histories = trainer.train_kfold(
-            train_dataset,
-            k=k_folds,
-            epochs=epochs,
-            batch_size=batch_size,
-            lr=0.001,
-            patience=patience,
-            use_amp=True,
-            num_workers=6,
-            persistent_workers=True,
-            prefetch_factor=4
-        )
-        trained_models[model_type] = models[0]
-        training_times[model_type] = trainer.training_time
-
-    # Evaluate and Compare
-    print("\n### STEP 4: Model Evaluation and Comparison ###")
-
-    evaluator = ModelEvaluator()
-
-    for model_name, model in trained_models.items():
-        evaluator.evaluate_model(model, test_loader, model_name)
-
-    comparison_df = evaluator.compare_models(training_times=training_times)
-
-    # Visualize Predictions
-    print("\n### STEP 5: Visualizing Predictions ###")
-    visualize_predictions(trained_models, test_dataset)
-
-    print("\n" + "=" * 60)
-    print("PROJECT COMPLETED SUCCESSFULLY!")
-    print("=" * 60)
-    print("\nGenerated files:")
-    print("- model_comparison.png")
-    print("- time_vs_quality.png")
-    print("- predictions_comparison.png")
-
-    # Dataset-specific notes
-    if choice == '2':
-        print("\n✓ Trained on SEN12MS-CR sen12mscr_dataset (real Sentinel-2 data)")
-        print(f"  - Training samples: {len(train_dataset)}")
-        print(f"  - Validation samples: {len(val_dataset)}")
-        print(f"  - Spectral bands: {len(bands)}")
-        print(f"  - Seasons: Spring + Winter")
-    else:
-        print("\n📝 Note: You used synthetic data. For better results:")
-        print("   1. Download SEN12MS-CR sen12mscr_dataset from TUM")
-        print("   2. Extract tar files to current directory")
-        print("   3. Run: python sen12mscr_dataset.py (option 1)")
-        print("   4. Run this script again and choose option 2")
+        print(f"Best Quality (PSNR):     {best_quality:.<20} {df.loc[best_quality, 'PSNR_dB']:.2f} dB")
+        print(f"Fastest Inference:       {best_speed:.<20} {df.loc[best_speed, 'Throughput_img_s']:.2f} img/s")
+        print(f"Fastest Training:        {fastest_train:.<20} {df.loc[fastest_train, 'Training_Time_min']:.2f} min")
+        print(f"{'=' * 70}")
 
 
-def visualize_predictions(models, test_dataset, n_samples=3):
-    """Visualize predictions from all models"""
+def visualize_predictions(models, dataset, device, output_dir, n_samples=5):
+    """Generate prediction visualizations"""
+    print(f"\nGenerating prediction visualizations...")
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    fig, axes = plt.subplots(n_samples, len(models) + 3,
+                             figsize=(4 * (len(models) + 3), 4 * n_samples))
 
-    fig, axes = plt.subplots(n_samples, len(models) + 2, figsize=(20, 4*n_samples))
+    for i in range(min(n_samples, len(dataset))):
+        s1, s2_cloudy, s2_clean, cloud_mask = dataset[i]
 
-    for i in range(n_samples):
-        cloudy, clean = test_dataset[i]
-        cloudy_input = cloudy.unsqueeze(0).to(device)
+        # Prepare inputs
+        s2_cloudy_input = s2_cloudy.unsqueeze(0).to(device)
 
-        # Display cloudy input
-        cloudy_rgb = cloudy[:3].permute(1, 2, 0).numpy()
+        # Extract RGB (bands 0,1,2 = B02,B03,B04 = Blue,Green,Red)
+        cloudy_rgb = s2_cloudy[[2, 1, 0]].permute(1, 2, 0).cpu().numpy()
+        clean_rgb = s2_clean[[2, 1, 0]].permute(1, 2, 0).cpu().numpy()
+        mask_viz = cloud_mask[0].cpu().numpy()
+
+        # Plot cloudy input
         axes[i, 0].imshow(np.clip(cloudy_rgb, 0, 1))
-        axes[i, 0].set_title('Cloudy Input')
+        axes[i, 0].set_title('Cloudy Input' if i == 0 else '')
         axes[i, 0].axis('off')
 
-        # Display clean target
-        clean_rgb = clean[:3].permute(1, 2, 0).numpy()
+        # Plot clean target
         axes[i, 1].imshow(np.clip(clean_rgb, 0, 1))
-        axes[i, 1].set_title('Clean Target')
+        axes[i, 1].set_title('Clean Target' if i == 0 else '')
         axes[i, 1].axis('off')
 
-        # Display predictions from each model
+        # Plot cloud mask
+        axes[i, 2].imshow(mask_viz, cmap='hot', vmin=0, vmax=1)
+        axes[i, 2].set_title('Cloud Mask' if i == 0 else '')
+        axes[i, 2].axis('off')
+
+        # Plot predictions
         for j, (model_name, model) in enumerate(models.items()):
             model.eval()
             with torch.no_grad():
                 if 'LSTM' in model_name:
-                    cloudy_input_lstm = cloudy_input.unsqueeze(1)
-                    pred = model(cloudy_input_lstm)
+                    input_tensor = s2_cloudy_input.unsqueeze(1)
                 else:
-                    pred = model(cloudy_input)
+                    input_tensor = s2_cloudy_input
 
-                pred_rgb = pred[0, :3].cpu().permute(1, 2, 0).numpy()
-                axes[i, j + 2].imshow(np.clip(pred_rgb, 0, 1))
-                axes[i, j + 2].set_title(f'{model_name} Output')
-                axes[i, j + 2].axis('off')
+                pred = model(input_tensor)
+                pred_rgb = pred[0, [2, 1, 0]].cpu().permute(1, 2, 0).numpy()
+
+                axes[i, j + 3].imshow(np.clip(pred_rgb, 0, 1))
+                axes[i, j + 3].set_title(model_name if i == 0 else '')
+                axes[i, j + 3].axis('off')
 
     plt.tight_layout()
-    plt.savefig('predictions_comparison.png', dpi=300, bbox_inches='tight')
+    plot_path = output_dir / 'predictions_comparison.png'
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print("Predictions visualization saved to: predictions_comparison.png")
+    print(f"✓ Saved predictions: {plot_path}")
 
 
-# ==================== ADDITIONAL UTILITIES ====================
+def visualize_dataset_samples(dataset, output_dir, n_samples=3):
+    """Visualize dataset samples"""
+    print(f"\nVisualizing dataset samples...")
 
-class ExperimentLogger:
-    """Log experiment results for reproducibility"""
+    fig, axes = plt.subplots(n_samples, 4, figsize=(16, 4 * n_samples))
+    if n_samples == 1:
+        axes = axes.reshape(1, -1)
 
-    def __init__(self, log_file='experiment_log.txt'):
-        self.log_file = log_file
+    for i in range(min(n_samples, len(dataset))):
+        s1, s2_cloudy, s2_clean, cloud_mask = dataset[i]
 
-    def log_experiment(self, config, results):
-        """Log experiment configuration and results"""
-        with open(self.log_file, 'a') as f:
-            f.write("\n" + "="*60 + "\n")
-            f.write(f"Experiment Date: {pd.Timestamp.now()}\n")
-            f.write("\nConfiguration:\n")
-            for key, value in config.items():
-                f.write(f"  {key}: {value}\n")
+        # RGB extraction (bands B04,B03,B02 = indices 2,1,0 in our 4-band selection)
+        cloudy_rgb = s2_cloudy[[2, 1, 0]].permute(1, 2, 0).numpy()
+        clean_rgb = s2_clean[[2, 1, 0]].permute(1, 2, 0).numpy()
 
-            f.write("\nResults:\n")
-            for model, metrics in results.items():
-                f.write(f"\n{model}:\n")
-                for metric, value in metrics.items():
-                    f.write(f"  {metric}: {value:.6f}\n")
+        axes[i, 0].imshow(np.clip(cloudy_rgb, 0, 1))
+        axes[i, 0].set_title('S2 Cloudy (RGB)')
+        axes[i, 0].axis('off')
 
-        print(f"Experiment logged to: {self.log_file}")
+        axes[i, 1].imshow(np.clip(clean_rgb, 0, 1))
+        axes[i, 1].set_title('S2 Clean (RGB)')
+        axes[i, 1].axis('off')
 
+        axes[i, 2].imshow(cloud_mask[0].numpy(), cmap='hot', vmin=0, vmax=1)
+        axes[i, 2].set_title('Cloud Mask')
+        axes[i, 2].axis('off')
 
-def save_models(models, save_dir='./saved_models'):
-    """Save trained models"""
-    save_dir = Path(save_dir)
-    save_dir.mkdir(exist_ok=True)
+        diff = np.abs(cloudy_rgb - clean_rgb)
+        axes[i, 3].imshow(diff)
+        axes[i, 3].set_title('Difference')
+        axes[i, 3].axis('off')
 
-    for model_name, model in models.items():
-        path = save_dir / f'{model_name}.pth'
-        torch.save(model.state_dict(), path)
-        print(f"Saved {model_name} to {path}")
+    plt.tight_layout()
+    plot_path = output_dir / 'dataset_samples.png'
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"✓ Saved dataset samples: {plot_path}")
+# ==================== MAIN EXECUTION ====================
 
+def main():
+    """Fully automated training pipeline"""
 
+    print(f"\nConfiguration:")
+    print(f"  Dataset:         {Config.DATASET_ROOT}")
+    print(f"  Bands:           {len(Config.S2_BANDS)} (RGB + NIR)")
+    print(f"  Data Fraction:   {Config.DATA_FRACTION * 100:.0f}%")
+    print(f"  Patch Size:      {Config.PATCH_SIZE}x{Config.PATCH_SIZE}")
+    print(f"  Batch Size:      {Config.BATCH_SIZE}")
+    print(f"  Epochs:          {Config.EPOCHS}")
+    print(f"  Models:          {', '.join(Config.MODELS)}")
+    print("=" * 70)
 
+    # Create output directory
+    Config.OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
+    # ==================== LOAD DATASET ====================
+    print("\n### STEP 1: Loading Dataset ###")
 
-# ==================== ADVANCED FEATURES ====================
+    try:
+        # Training dataset (5% of data)
+        full_dataset = SEN12MSCRDataset(
+            root_dir=Config.DATASET_ROOT,
+            seasons=Config.SEASONS,
+            s2_bands=Config.S2_BANDS,
+            patch_size=Config.PATCH_SIZE,
+            data_fraction=Config.DATA_FRACTION,
+            min_cloud_fraction=0.05,
+            max_cloud_fraction=0.95,
+            random_seed=42
+        )
 
-class CloudDetector:
-    """Detect and mask clouds in images"""
+        scene_to_indices = defaultdict(list)
+        for idx, sample in enumerate(full_dataset.samples):
+            # Extract season and scene_id from sample paths
+            s2_clean_path = sample['s2_clean']
+            # Path format: .../ROIsXXXX_season_s2/s2_X/patch.tif
+            parts = s2_clean_path.parts
+            season = parts[-3].split('_s2')[0]  # ROIsXXXX_season
+            scene_id = parts[-2].split('_')[1]  # s2_X -> X
+            scene_key = f"{season}_{scene_id}"
+            scene_to_indices[scene_key].append(idx)
 
-    @staticmethod
-    def detect_clouds(image, threshold=0.7):
-        """Simple cloud detection based on brightness"""
-        # Average across spectral bands
-        brightness = image.mean(axis=0)
-        cloud_mask = brightness > threshold
-        return cloud_mask
+        # Split scenes 80/20
+        scene_keys = list(scene_to_indices.keys())
+        train_scenes, val_scenes = train_test_split(
+            scene_keys,
+            test_size=0.2,
+            random_state=42
+        )
 
-    @staticmethod
-    def create_cloud_free_composite(image_stack):
-        """Create cloud-free composite from time series"""
-        # Use median of non-cloudy pixels across time
-        masks = [CloudDetector.detect_clouds(img) for img in image_stack]
+        # Get indices for each split
+        train_indices = [idx for scene in train_scenes for idx in scene_to_indices[scene]]
+        val_indices = [idx for scene in val_scenes for idx in scene_to_indices[scene]]
 
-        composite = np.zeros_like(image_stack[0])
-        for band in range(image_stack[0].shape[0]):
-            band_stack = np.array([img[band] for img in image_stack])
-            # Mask cloudy pixels
-            for i, mask in enumerate(masks):
-                band_stack[i][mask] = np.nan
-            # Take median
-            composite[band] = np.nanmedian(band_stack, axis=0)
+        # Create subset datasets
+        train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
 
-        return composite
+        print(f"\n✓ Dataset loaded successfully!")
+        print(f"  Total scenes:       {len(scene_keys)}")
+        print(f"  Training scenes:    {len(train_scenes)} ({len(train_scenes) / len(scene_keys) * 100:.1f}%)")
+        print(f"  Validation scenes:  {len(val_scenes)} ({len(val_scenes) / len(scene_keys) * 100:.1f}%)")
+        print(f"  Training samples:   {len(train_dataset)}")
+        print(f"  Validation samples: {len(val_dataset)}")
+        print(f"  Bands:              {len(Config.S2_BANDS)}")
 
+    except Exception as e:
+        print(f"\n✗ Error loading dataset: {e}")
+        print("\nPlease ensure:")
+        print("  1. Dataset extracted to ./sen12mscr_dataset/")
+        print("  2. Directory structure is correct")
+        print("  3. Run: python data_loader.py (option 1) to extract tar files")
+        return
 
-class TemporalDataGenerator:
-    """Generate temporal sequences for LSTM training"""
-
-    def __init__(self, base_dataset, sequence_length=3):
-        self.base_dataset = base_dataset
-        self.sequence_length = sequence_length
-
-    def create_sequences(self):
-        """Create temporal sequences from sen12mscr_dataset"""
-        sequences = []
-
-        for i in range(len(self.base_dataset) - self.sequence_length):
-            seq_cloudy = []
-            for j in range(self.sequence_length):
-                cloudy, _ = self.base_dataset[i + j]
-                seq_cloudy.append(cloudy)
-
-            # Target is the clean version of last image
-            _, clean = self.base_dataset[i + self.sequence_length - 1]
-
-            sequences.append((torch.stack(seq_cloudy), clean))
-
-        return sequences
-
-
-# ==================== USAGE EXAMPLES ====================
-
-def quick_start_example():
-    """Quick start example using SEN12MSCRDataset"""
-    print("\n### QUICK START – SEN12MS-CR ###\n")
-
-    base_dir = "./sen12mscr_dataset"  # <-- root SEN12MS-CR
-
-    # ---------------- DATASET ----------------
-    train_dataset = SEN12MSCRDataset(
-        base_dir=base_dir,
-        seasons=["summer"],
-        split="small",        # szybki start
-        use_s1=False,         # tylko S2
-    )
-
-    val_dataset = SEN12MSCRDataset(
-        base_dir=base_dir,
-        seasons=["summer"],
-        split="val",
-        use_s1=False,
-    )
-
-    print(f"Train samples: {len(train_dataset)}")
-    print(f"Val samples:   {len(val_dataset)}")
-
+        # Create DataLoaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=4,
+        batch_size=Config.BATCH_SIZE,
         shuffle=True,
-        num_workers=4,
+        num_workers=Config.NUM_WORKERS,
         pin_memory=True,
+        drop_last=True
     )
 
     val_loader = DataLoader(
         val_dataset,
-        batch_size=4,
+        batch_size=Config.BATCH_SIZE,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True,
+        num_workers=Config.NUM_WORKERS // 2,
+        pin_memory=True
+    )
+    print("\nChecking sample statistics...")
+    for i in range(min(3, len(full_dataset))):
+        s1, s2_cloudy, s2_clean, cloud_mask = full_dataset[i]
+        print(f"\nSample {i + 1}:")
+        print(f"  S2 Cloudy - min: {s2_cloudy.min():.4f}, max: {s2_cloudy.max():.4f}, mean: {s2_cloudy.mean():.4f}")
+        print(f"  S2 Clean  - min: {s2_clean.min():.4f}, max: {s2_clean.max():.4f}, mean: {s2_clean.mean():.4f}")
+        print(f"  Cloud Mask - mean coverage: {cloud_mask.mean():.2%}")
+    # Visualize dataset
+    visualize_dataset_samples(val_dataset, Config.OUTPUT_DIR, n_samples=3)
+
+    # ==================== TRAIN MODELS ====================
+    print("\n### STEP 2: Training Models ###")
+
+    trained_models = {}
+    training_times = {}
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"\nUsing device: {device}")
+    if device == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    for model_name in Config.MODELS:
+        print(f"\n{'=' * 70}")
+        print(f"Training {model_name}")
+        print(f"{'=' * 70}")
+
+        start_time = time.time()
+
+        try:
+            # Initialize trainer
+            trainer = ModelTrainer(model_name, device=device)
+
+            # Train with K-Fold (K=1 for speed, change to 3-5 for better results)
+            # Note: We use the full_dataset for k-fold to ensure proper scene-level splitting
+            models, histories = trainer.train_kfold(
+                dataset=train_dataset,
+                k=2,  # Single fold for speed
+                epochs=Config.EPOCHS,
+                batch_size=Config.BATCH_SIZE,
+                lr=Config.LEARNING_RATE,
+                patience=Config.PATIENCE,
+                use_amp=Config.USE_AMP,
+                num_workers=Config.NUM_WORKERS,
+                persistent_workers=True,
+                prefetch_factor=3
+            )
+
+            trained_models[model_name] = models[0]
+            training_times[model_name] = time.time() - start_time
+
+            print(f"\n✓ {model_name} training complete: {training_times[model_name] / 60:.2f} min")
+
+        except Exception as e:
+            print(f"\n✗ Error training {model_name}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    if not trained_models:
+        print("\n✗ No models were trained successfully!")
+        return
+
+    # ==================== EVALUATE MODELS ====================
+    print("\n### STEP 3: Evaluating Models ###")
+
+    evaluator = ModelEvaluator(device=device)
+
+    for model_name, model in trained_models.items():
+        try:
+            evaluator.evaluate_model(model, val_loader, model_name)
+        except Exception as e:
+            print(f"\n✗ Error evaluating {model_name}: {e}")
+            continue
+
+    # ==================== GENERATE REPORTS ====================
+    print("\n### STEP 4: Generating Comparison Reports ###")
+
+    comparison_df = evaluator.generate_comparison_report(
+        training_times,
+        Config.OUTPUT_DIR
     )
 
-    # ---------------- TRAINING ----------------
-    trainer = ModelTrainer("SimpleCNN")
+    # ==================== VISUALIZE PREDICTIONS ====================
+    print("\n### STEP 5: Visualizing Predictions ###")
 
-    models, history = trainer.train(
-        train_loader=train_loader,
-        val_loader=val_loader,
-        epochs=5,
+    visualize_predictions(
+        trained_models,
+        val_dataset,
+        device,
+        Config.OUTPUT_DIR,
+        n_samples=5
     )
 
-    # ---------------- EVALUATION ----------------
-    evaluator = ModelEvaluator()
-    evaluator.evaluate_model(
-        model=models[0],
-        dataloader=val_loader,
-        model_name="SimpleCNN",
-    )
+    # ==================== SAVE MODELS ====================
+    if Config.SAVE_MODELS:
+        print("\n### STEP 6: Saving Models ###")
+        model_dir = Config.OUTPUT_DIR / 'saved_models'
+        model_dir.mkdir(exist_ok=True)
 
-    print("\nQuick start completed!")
+        for model_name, model in trained_models.items():
+            model_path = model_dir / f'{model_name}.pth'
+            torch.save(model.state_dict(), model_path)
+            print(f"✓ Saved {model_name}: {model_path}")
 
-def advanced_example():
-    """Advanced example with custom configurations"""
-    print("\n### ADVANCED EXAMPLE ###\n")
+    # ==================== FINAL SUMMARY ====================
+    print("\n" + "=" * 70)
+    print("PIPELINE COMPLETED SUCCESSFULLY!")
+    print("=" * 70)
+    print(f"\nGenerated outputs in {Config.OUTPUT_DIR}:")
+    print("  ✓ model_comparison.csv       - Detailed metrics comparison")
+    print("  ✓ metrics_comparison.png     - All metrics visualized")
+    print("  ✓ efficiency_analysis.png    - Training/inference efficiency")
+    print("  ✓ predictions_comparison.png - Model predictions")
+    print("  ✓ dataset_samples.png        - Dataset visualization")
+    if Config.SAVE_MODELS:
+        print("  ✓ saved_models/              - Trained model weights")
 
-    # Custom configuration
-    config = {
-        'n_samples': 200,
-        'img_size': (512, 512),
-        'n_bands': 13,  # Full Sentinel-2 bands
-        'k_folds': 3,
-        'epochs': 30,
-        'batch_size': 16,
-        'learning_rate': 0.0001
-    }
+    print(f"\nTraining Summary:")
+    for model_name, train_time in training_times.items():
+        psnr = comparison_df.loc[model_name, 'PSNR_dB']
+        throughput = comparison_df.loc[model_name, 'Throughput_img_s']
+        print(f"  {model_name:.<15} {train_time / 60:>6.2f} min  │  {psnr:>6.2f} dB  │  {throughput:>6.2f} img/s")
 
-    print("Advanced configuration:")
-    for key, value in config.items():
-        print(f"  {key}: {value}")
-
-    print("\nTo run advanced example:")
-    print("1. Increase sen12mscr_dataset size and image resolution")
-    print("2. Use all 13 Sentinel-2 bands")
-    print("3. Train longer with more folds")
-    print("4. Implement data augmentation")
-    print("5. Use learning rate scheduling")
-    print("6. Add early stopping")
+    print("=" * 70)
+    print("\n✓ All done! Check the results directory for outputs.")
 
 
 if __name__ == '__main__':
-    # Run main pipeline
     main()
-
-    # Uncomment for quick start or advanced examples
-    quick_start_example()
-    # advanced_example()
-
-    """
-    
-    
-    
-    
-    Validation methods . pixel similiarity error, brightness,contrast,
-    
-    autotune vs no autotune
-    cpu/ram bottleneck
-
-    2. Implementing Sentinel-2 data:
-        - 
-    
-    3. Model improvements:
-       - Add attention mechanisms
-       - Use perceptual loss functions
-       - Add temporal consistency constraints
-    
-    4. Evaluation enhancements:
-       - Calculate per-band metrics
-       - Add cloud coverage stratified analysis
-       - Implement visual quality metrics (FID, LPIPS)
-       - Compare with traditional methods (linear interpolation)
-
-    """

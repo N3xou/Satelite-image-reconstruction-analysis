@@ -375,7 +375,6 @@ class SEN12MSCRDataset(Dataset):
         )
 
 
-
 class SEN12MSCRSplitter:
     """Split and organize SEN12MS-CR dataset into train/val/small directories"""
 
