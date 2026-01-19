@@ -82,10 +82,22 @@ class ModelTrainer:
             List of (train_indices, val_indices) tuples for each fold
         """
         # Group samples by scene
+        actual_dataset = dataset
+        is_subset = isinstance(dataset, torch.utils.data.Subset)
+        if is_subset:
+            actual_dataset = dataset.dataset
+            subset_indices = dataset.indices
+
+        # Group samples by scene
         scene_to_indices = defaultdict(list)
 
-        for idx, sample in enumerate(dataset.samples):
-            # Extract season and scene_id from sample paths
+        # If it's a subset, we only want to iterate over the subset's specific indices
+        indices_to_iterate = range(len(dataset)) if not is_subset else range(len(subset_indices))
+
+        for idx in indices_to_iterate:
+            # Get the actual sample from the underlying dataset
+            sample_idx = idx if not is_subset else subset_indices[idx]
+            sample = actual_dataset.samples[sample_idx]
             s2_clean_path = sample['s2_clean']
             # Path format: .../ROIsXXXX_season_s2/s2_X/patch.tif
             parts = s2_clean_path.parts
@@ -99,8 +111,8 @@ class ModelTrainer:
 
         print(f"\nDataset scene-level statistics:")
         print(f"  Total scenes: {len(scene_keys)}")
-        print(f"  Total samples: {len(dataset.samples)}")
-        print(f"  Avg samples per scene: {len(dataset.samples) / len(scene_keys):.1f}")
+        print(f"  Total samples: {len(actual_dataset.samples)}")
+        print(f"  Avg samples per scene: {len(actual_dataset.samples) / len(scene_keys):.1f}")
 
         # K-Fold on scenes
         kfold = KFold(n_splits=k, shuffle=True, random_state=42)
@@ -180,23 +192,27 @@ class ModelTrainer:
                 prefetch_factor=prefetch_factor if num_workers > 0 else None
             )
 
-            # Initialize model
+            base_dataset = dataset.dataset if isinstance(dataset, torch.utils.data.Subset) else dataset
+            in_channels = 2 + len(base_dataset.s2_bands)
+            # Output = Clean S2 (13 bands)
+            out_channels = len(base_dataset.s2_bands)
+
             if self.model_type == 'UNet':
-                model = UNet(in_channels=len(dataset.s2_bands),
-                             out_channels=len(dataset.s2_bands)).to(self.device)
+                model = UNet(in_channels=in_channels,
+                             out_channels=out_channels).to(self.device)
             elif self.model_type == 'SimpleCNN':
-                model = SimpleCNN(in_channels=len(dataset.s2_bands),
-                                  out_channels=len(dataset.s2_bands)).to(self.device)
+                model = SimpleCNN(in_channels=in_channels,
+                                  out_channels=out_channels).to(self.device)
             elif self.model_type == 'GAN':
                 model = self._train_gan_fold(train_loader, val_loader, epochs, lr,
-                                             patience, use_amp, len(dataset.s2_bands))
+                                             patience, use_amp, in_channels, out_channels)
                 self.models.append(model)
                 continue
             elif self.model_type == 'LSTM':
-                model = LSTMCloudRemover(in_channels=len(dataset.s2_bands)).to(self.device)
+                model = LSTMCloudRemover(in_channels=in_channels).to(self.device)
             elif self.model_type == 'Diffusion':
                 model = self._train_diffusion_fold(train_loader, val_loader, epochs,
-                                                   lr, patience, use_amp, len(dataset.s2_bands))
+                                                   lr, patience, use_amp, in_channels)
                 self.models.append(model)
                 continue
             else:
@@ -239,25 +255,29 @@ class ModelTrainer:
             model.train()
             train_loss = 0
             for s1, s2_cloudy, s2_clean, cloud_mask in train_loader:
+                s1 = s1.to(self.device, non_blocking=True)
                 s2_cloudy = s2_cloudy.to(self.device, non_blocking=True)
                 s2_clean = s2_clean.to(self.device, non_blocking=True)
 
+                # Concatenate S1 and S2 for model input
+                model_input = torch.cat([s1, s2_cloudy], dim=1)
+
                 # Handle LSTM input
                 if self.model_type == 'LSTM':
-                    s2_cloudy = s2_cloudy.unsqueeze(1)
+                    model_input = model_input.unsqueeze(1)
 
                 optimizer.zero_grad(set_to_none=True)
 
                 # Mixed precision forward pass
                 if use_amp and scaler is not None:
                     with torch.cuda.amp.autocast():
-                        output = model(s2_cloudy)
+                        output = model(model_input)
                         loss = criterion(output, s2_clean)
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
                 else:
-                    output = model(s2_cloudy)
+                    output = model(model_input)
                     loss = criterion(output, s2_clean)
                     loss.backward()
                     optimizer.step()
@@ -269,18 +289,21 @@ class ModelTrainer:
             val_loss = 0
             with torch.no_grad():
                 for s1, s2_cloudy, s2_clean, cloud_mask in val_loader:
+                    s1 = s1.to(self.device, non_blocking=True)
                     s2_cloudy = s2_cloudy.to(self.device, non_blocking=True)
                     s2_clean = s2_clean.to(self.device, non_blocking=True)
 
+                    model_input = torch.cat([s1, s2_cloudy], dim=1)
+
                     if self.model_type == 'LSTM':
-                        s2_cloudy = s2_cloudy.unsqueeze(1)
+                        model_input = model_input.unsqueeze(1)
 
                     if use_amp and self.device == 'cuda':
                         with torch.cuda.amp.autocast():
-                            output = model(s2_cloudy)
+                            output = model(model_input)
                             loss = criterion(output, s2_clean)
                     else:
-                        output = model(s2_cloudy)
+                        output = model(model_input)
                         loss = criterion(output, s2_clean)
 
                     val_loss += loss.item()

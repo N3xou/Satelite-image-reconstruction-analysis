@@ -195,8 +195,8 @@ class SEN12MSCRDataset(Dataset):
         s2_bands=None,
         patch_size=256,
         data_fraction=1.0,
-        min_cloud_fraction=0.05,
-        max_cloud_fraction=0.95,
+        min_cloud_fraction=0.15,
+        max_cloud_fraction=0.6,
         random_seed=42
     ):
         self.root_dir = Path(root_dir)

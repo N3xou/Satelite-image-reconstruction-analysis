@@ -33,7 +33,7 @@ class Config:
     # Dataset
     DATASET_ROOT = "./sen12mscr_dataset"
     SEASONS = None  # None = all seasons
-    S2_BANDS = [2, 3, 4, 8]  # RGB + NIR (Blue, Green, Red, NIR)
+    S2_BANDS = list(range(1, 14))  # RGB + NIR (Blue, Green, Red, NIR)
     PATCH_SIZE = 256
     DATA_FRACTION = 0.05  # Use 5% of data for quick training
 
@@ -46,7 +46,8 @@ class Config:
     NUM_WORKERS = 4
 
     # Models to train
-    MODELS = ['SimpleCNN', 'UNet', 'GAN']  # Fast models for demo
+    MODELS = ['SimpleCNN']
+    #MODELS = ['SimpleCNN', 'UNet', 'GAN']  # Fast models for demo
     # MODELS = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']  # All models
 
     # Output
@@ -170,22 +171,24 @@ class ModelEvaluator:
 
         with torch.no_grad():
             for batch_idx, (s1, s2_cloudy, s2_clean, cloud_mask) in enumerate(test_loader):
+                s1 = s1.to(self.device, non_blocking=True)
                 s2_cloudy = s2_cloudy.to(self.device, non_blocking=True)
                 s2_clean = s2_clean.to(self.device, non_blocking=True)
+                cloud_mask = cloud_mask.to(self.device, non_blocking=True)
+
+                model_input = torch.cat([s1, s2_cloudy], dim=1)
 
                 # Handle LSTM special input
                 if 'LSTM' in model_name:
-                    s2_cloudy = s2_cloudy.unsqueeze(1)
+                    model_input = model_input.unsqueeze(1)
 
                 # Measure inference time
                 if self.device == 'cuda':
                     torch.cuda.synchronize()
                 start_time = time.time()
 
-                output = model(s2_cloudy)
+                output = model(model_input)
 
-                if self.device == 'cuda':
-                    torch.cuda.synchronize()
                 inference_time = time.time() - start_time
                 inference_times.append(inference_time)
 
@@ -257,6 +260,9 @@ class ModelEvaluator:
 
     def generate_comparison_report(self, training_times, output_dir):
         """Generate comprehensive comparison visualizations"""
+        if not self.results:
+            print("\n⚠️ No results found to generate comparison report.")
+            return None
         df = pd.DataFrame(self.results).T
 
         # Add training times
@@ -285,22 +291,28 @@ class ModelEvaluator:
 
     def _plot_metrics_comparison(self, df, output_dir):
         """Plot all metrics comparison"""
-        metrics = ['MSE', 'MAE', 'RMSE', 'PSNR_dB', 'SSIM',
-                   'Inference_Time_s', 'Throughput_img_s', 'Training_Time_min']
+        metrics = [col for col in df.columns if col != 'Model']
+        num_metrics = len(metrics)
 
-        fig, axes = plt.subplots(3, 3, figsize=(18, 12))
-        axes = axes.flatten()
+        fig, axes = plt.subplots(num_metrics, 1, figsize=(10, 5 * num_metrics))
+        if num_metrics == 1:
+            axes = [axes]
 
-        colors = plt.cm.Set3(range(len(df)))
+        # Define a robust color palette
+        default_colors = ['#4e79a7', '#f28e2b', '#e15759', '#76b7b2', '#59a14f']
 
-        for i, metric in enumerate(metrics):
-            if i < len(axes) and metric in df.columns:
-                ax = axes[i]
-                df[metric].plot(kind='bar', ax=ax, color=colors)
-                ax.set_title(f'{metric}', fontsize=14, fontweight='bold')
-                ax.set_ylabel(metric, fontsize=11)
-                ax.tick_params(axis='x', rotation=45)
-                ax.grid(axis='y', alpha=0.3)
+        for i, (metric, ax) in enumerate(zip(metrics, axes)):
+            # Ensure we have enough colors for the number of bars
+            colors = default_colors[:len(df)]
+            if not colors:
+                colors = 'skyblue'  # Fallback to a single string color
+
+            df[metric].plot(kind='bar', ax=ax, color=colors)
+            ax.set_title(f'Model Comparison: {metric}')
+            ax.set_ylabel('Value')
+            if 'Model' in df.columns and not df.empty:
+                ax.set_xticklabels(df['Model'], rotation=45)
+            ax.grid(axis='y', linestyle='--', alpha=0.7)
 
         # Hide unused subplots
         for i in range(len(metrics), len(axes)):
@@ -362,60 +374,74 @@ class ModelEvaluator:
         print(f"{'=' * 70}")
 
 
-def visualize_predictions(models, dataset, device, output_dir, n_samples=5):
-    """Generate prediction visualizations"""
-    print(f"\nGenerating prediction visualizations...")
+def visualize_predictions(models, dataset, device, output_dir, n_samples=3):
+    """Generate comprehensive comparison for all trained models across samples"""
+    if not models:
+        print("⚠️ No models available for visualization.")
+        return
 
-    fig, axes = plt.subplots(n_samples, len(models) + 3,
-                             figsize=(4 * (len(models) + 3), 4 * n_samples))
+    print(f"\nGenerating all-model comparison (3 samples, {len(models) + 5} columns)...")
+
+    # We need 5 columns for inputs/GT + 1 column for each model
+    n_cols = 5 + len(models)
+    fig, axes = plt.subplots(n_samples, n_cols, figsize=(4 * n_cols, 4 * n_samples))
+
+    # Ensure axes is 2D even if n_samples=1
+    if n_samples == 1:
+        axes = axes.reshape(1, -1)
 
     for i in range(min(n_samples, len(dataset))):
-        s1, s2_cloudy, s2_clean, cloud_mask = dataset[i]
+        s1, s2_cloudy, s2_clean, cloud_mask = dataset[i+3000]
+        model_input = torch.cat([s1, s2_cloudy], dim=0).unsqueeze(0).to(device)
 
-        # Prepare inputs
-        s2_cloudy_input = s2_cloudy.unsqueeze(0).to(device)
-
-        # Extract RGB (bands 0,1,2 = B02,B03,B04 = Blue,Green,Red)
-        cloudy_rgb = s2_cloudy[[2, 1, 0]].permute(1, 2, 0).cpu().numpy()
-        clean_rgb = s2_clean[[2, 1, 0]].permute(1, 2, 0).cpu().numpy()
+        # Common visualizations - FIXED: Using indices [3, 2, 1] for RGB (B4, B3, B2)
+        # Added a 5x multiplier for basic visibility, better than black
+        cloudy_rgb = np.clip(s2_cloudy[[3, 2, 1]].permute(1, 2, 0).cpu().numpy() * 5, 0, 1)
+        clean_rgb = np.clip(s2_clean[[3, 2, 1]].permute(1, 2, 0).cpu().numpy() * 5, 0, 1)
+        s1_viz = s1[0].cpu().numpy()
         mask_viz = cloud_mask[0].cpu().numpy()
+        diff_viz = np.clip(np.abs(cloudy_rgb - clean_rgb) * 2, 0, 1)  # Boost diff visibility
 
-        # Plot cloudy input
+        # --- Input Columns ---
+        axes[i, 0].imshow(cloudy_rgb)
         axes[i, 0].imshow(np.clip(cloudy_rgb, 0, 1))
-        axes[i, 0].set_title('Cloudy Input' if i == 0 else '')
-        axes[i, 0].axis('off')
+        axes[i, 0].set_title('1. Cloudy Input' if i == 0 else '')
 
-        # Plot clean target
-        axes[i, 1].imshow(np.clip(clean_rgb, 0, 1))
-        axes[i, 1].set_title('Clean Target' if i == 0 else '')
-        axes[i, 1].axis('off')
+        axes[i, 1].imshow(s1_viz, cmap='gray')
+        axes[i, 1].set_title('2. S1 (SAR)' if i == 0 else '')
 
-        # Plot cloud mask
-        axes[i, 2].imshow(mask_viz, cmap='hot', vmin=0, vmax=1)
-        axes[i, 2].set_title('Cloud Mask' if i == 0 else '')
-        axes[i, 2].axis('off')
+        axes[i, 2].imshow(mask_viz, cmap='hot')
+        axes[i, 2].set_title('3. Cloud Mask' if i == 0 else '')
 
-        # Plot predictions
+        axes[i, 3].imshow(np.clip(diff_viz, 0, 1))
+        axes[i, 3].set_title('4. Difference' if i == 0 else '')
+
+        axes[i, 4].imshow(np.clip(clean_rgb, 0, 1))
+        axes[i, 4].set_title('5. Ground Truth' if i == 0 else '')
+
+        # --- Model Output Columns ---
         for j, (model_name, model) in enumerate(models.items()):
             model.eval()
             with torch.no_grad():
-                if 'LSTM' in model_name:
-                    input_tensor = s2_cloudy_input.unsqueeze(1)
-                else:
-                    input_tensor = s2_cloudy_input
+                # Handle LSTM special shape if needed
+                input_tensor = model_input.unsqueeze(1) if 'LSTM' in model_name else model_input
 
                 pred = model(input_tensor)
-                pred_rgb = pred[0, [2, 1, 0]].cpu().permute(1, 2, 0).numpy()
+                # FIXED: Using indices [3, 2, 1] for RGB and applying visibility boost
+                pred_rgb = np.clip(pred[0, [3, 2, 1]].cpu().permute(1, 2, 0).numpy() * 5, 0, 1)
 
-                axes[i, j + 3].imshow(np.clip(pred_rgb, 0, 1))
-                axes[i, j + 3].set_title(model_name if i == 0 else '')
-                axes[i, j + 3].axis('off')
+                col_idx = 5 + j
+                axes[i, col_idx].imshow(pred_rgb)
+                axes[i, col_idx].set_title(f'Output: {model_name}' if i == 0 else '')
+
+        for ax in axes[i]:
+            ax.axis('off')
 
     plt.tight_layout()
-    plot_path = output_dir / 'predictions_comparison.png'
+    plot_path = output_dir / 'all_models_comparison.png'
     plt.savefig(plot_path, dpi=300, bbox_inches='tight')
     plt.close()
-    print(f"✓ Saved predictions: {plot_path}")
+    print(f"✓ Saved multi-model comparison: {plot_path}")
 
 
 def visualize_dataset_samples(dataset, output_dir, n_samples=3):
@@ -427,13 +453,14 @@ def visualize_dataset_samples(dataset, output_dir, n_samples=3):
         axes = axes.reshape(1, -1)
 
     for i in range(min(n_samples, len(dataset))):
-        s1, s2_cloudy, s2_clean, cloud_mask = dataset[i]
+        s1, s2_cloudy, s2_clean, cloud_mask = dataset[100+i]
 
-        # RGB extraction (bands B04,B03,B02 = indices 2,1,0 in our 4-band selection)
-        cloudy_rgb = s2_cloudy[[2, 1, 0]].permute(1, 2, 0).numpy()
-        clean_rgb = s2_clean[[2, 1, 0]].permute(1, 2, 0).numpy()
+        # RGB extraction (bands B04,B03,B02 = indices 3, 2, 1)
+        # Added visibility boost (* 5)
+        cloudy_rgb = np.clip(s2_cloudy[[3, 2, 1]].permute(1, 2, 0).numpy() * 5, 0, 1)
+        clean_rgb = np.clip(s2_clean[[3, 2, 1]].permute(1, 2, 0).numpy() * 5, 0, 1)
 
-        axes[i, 0].imshow(np.clip(cloudy_rgb, 0, 1))
+        axes[i, 0].imshow(cloudy_rgb)
         axes[i, 0].set_title('S2 Cloudy (RGB)')
         axes[i, 0].axis('off')
 
@@ -580,12 +607,9 @@ def main():
         try:
             # Initialize trainer
             trainer = ModelTrainer(model_name, device=device)
-
-            # Train with K-Fold (K=1 for speed, change to 3-5 for better results)
-            # Note: We use the full_dataset for k-fold to ensure proper scene-level splitting
             models, histories = trainer.train_kfold(
                 dataset=train_dataset,
-                k=2,  # Single fold for speed
+                k=2,
                 epochs=Config.EPOCHS,
                 batch_size=Config.BATCH_SIZE,
                 lr=Config.LEARNING_RATE,
@@ -630,6 +654,9 @@ def main():
         training_times,
         Config.OUTPUT_DIR
     )
+    if comparison_df is None:
+        print("\n✗ Skipping summary: No evaluation results available.")
+        return
 
     # ==================== VISUALIZE PREDICTIONS ====================
     print("\n### STEP 5: Visualizing Predictions ###")
@@ -668,9 +695,12 @@ def main():
 
     print(f"\nTraining Summary:")
     for model_name, train_time in training_times.items():
-        psnr = comparison_df.loc[model_name, 'PSNR_dB']
-        throughput = comparison_df.loc[model_name, 'Throughput_img_s']
-        print(f"  {model_name:.<15} {train_time / 60:>6.2f} min  │  {psnr:>6.2f} dB  │  {throughput:>6.2f} img/s")
+            try:
+                psnr = comparison_df.loc[model_name, 'PSNR_dB']
+                throughput = comparison_df.loc[model_name, 'Throughput_img_s']
+                print(f"  {model_name:.<15} {train_time / 60:>6.2f} min  │  {psnr:>6.2f} dB  │  {throughput:>6.2f} img/s")
+            except KeyError:
+                print(f"  {model_name:.<15} {train_time / 60:>6.2f} min  │  Metrics missing")
 
     print("=" * 70)
     print("\n✓ All done! Check the results directory for outputs.")
