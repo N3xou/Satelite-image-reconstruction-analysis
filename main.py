@@ -33,7 +33,7 @@ class Config:
     # Dataset
     DATASET_ROOT = "./sen12mscr_dataset"
     SEASONS = None  # None = all seasons
-    S2_BANDS = list(range(1, 14))  # RGB + NIR (Blue, Green, Red, NIR)
+    S2_BANDS = list(range(1, 14))
     PATCH_SIZE = 256
     DATA_FRACTION = 0.05  # Use 5% of data for quick training
 
@@ -708,3 +708,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# TODO: Redukcja wymiarowosci
+# TODO: Wykrywanie chmur modelem
+# TODO: Testing self supervised learning (partly clear imaes, no ground truth)
