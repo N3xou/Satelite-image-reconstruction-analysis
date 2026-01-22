@@ -35,7 +35,7 @@ class Config:
     SEASONS = None  # None = all seasons
     S2_BANDS = list(range(1, 14))
     PATCH_SIZE = 256
-    DATA_FRACTION = 0.05  # Use 5% of data for quick training
+    DATA_FRACTION = 0.1 # Use 5% of data for quick training
 
     # Training
     BATCH_SIZE = 4
@@ -46,7 +46,7 @@ class Config:
     NUM_WORKERS = 4
 
     # Models to train
-    MODELS = ['SimpleCNN']
+    MODELS = ['SimpleCNN', 'UNet']
     #MODELS = ['SimpleCNN', 'UNet', 'GAN']  # Fast models for demo
     # MODELS = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']  # All models
 
@@ -391,7 +391,7 @@ def visualize_predictions(models, dataset, device, output_dir, n_samples=3):
         axes = axes.reshape(1, -1)
 
     for i in range(min(n_samples, len(dataset))):
-        s1, s2_cloudy, s2_clean, cloud_mask = dataset[i+3000]
+        s1, s2_cloudy, s2_clean, cloud_mask = dataset[i+1500]
         model_input = torch.cat([s1, s2_cloudy], dim=0).unsqueeze(0).to(device)
 
         # Common visualizations - FIXED: Using indices [3, 2, 1] for RGB (B4, B3, B2)
@@ -453,7 +453,7 @@ def visualize_dataset_samples(dataset, output_dir, n_samples=3):
         axes = axes.reshape(1, -1)
 
     for i in range(min(n_samples, len(dataset))):
-        s1, s2_cloudy, s2_clean, cloud_mask = dataset[100+i]
+        s1, s2_cloudy, s2_clean, cloud_mask = dataset[1000+i]
 
         # RGB extraction (bands B04,B03,B02 = indices 3, 2, 1)
         # Added visibility boost (* 5)
