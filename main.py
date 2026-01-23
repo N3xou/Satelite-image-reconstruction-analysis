@@ -5,6 +5,7 @@ Compares multiple approaches for reconstructing cloud-covered satellite imagery
 """
 
 import os
+import random
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -35,7 +36,7 @@ class Config:
     SEASONS = None  # None = all seasons
     S2_BANDS = list(range(1, 14))
     PATCH_SIZE = 256
-    DATA_FRACTION = 0.1 # Use 5% of data for quick training
+    DATA_FRACTION = 0.05 # Use 5% of data for quick training
 
     # Training
     BATCH_SIZE = 4
@@ -46,7 +47,7 @@ class Config:
     NUM_WORKERS = 4
 
     # Models to train
-    MODELS = ['SimpleCNN', 'UNet']
+    MODELS = ['RandomForest']
     #MODELS = ['SimpleCNN', 'UNet', 'GAN']  # Fast models for demo
     # MODELS = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']  # All models
 
@@ -171,6 +172,8 @@ class ModelEvaluator:
 
         with torch.no_grad():
             for batch_idx, (s1, s2_cloudy, s2_clean, cloud_mask) in enumerate(test_loader):
+                if batch_idx >= 20:
+                    break
                 s1 = s1.to(self.device, non_blocking=True)
                 s2_cloudy = s2_cloudy.to(self.device, non_blocking=True)
                 s2_clean = s2_clean.to(self.device, non_blocking=True)
@@ -186,8 +189,11 @@ class ModelEvaluator:
                 if self.device == 'cuda':
                     torch.cuda.synchronize()
                 start_time = time.time()
-
-                output = model(model_input)
+                if model_name == 'RandomForest':
+                    # Use predict() instead of forward()
+                    output = model.predict(s1, s2_cloudy, cloud_mask, device=self.device)
+                else:
+                    output = model(model_input)
 
                 inference_time = time.time() - start_time
                 inference_times.append(inference_time)
@@ -374,13 +380,26 @@ class ModelEvaluator:
         print(f"{'=' * 70}")
 
 
-def visualize_predictions(models, dataset, device, output_dir, n_samples=3):
+def get_stretched_rgb(img_tensor):
+    # RGB needs indices [3, 2, 1] for B04, B03, B02
+    n_bands = img_tensor.shape[0]
+    if n_bands >= 13:
+        rgb_indices = [3, 2, 1]
+    elif n_bands >= 3:
+        rgb_indices = [2, 1, 0]
+    else:
+        return img_tensor[0].cpu().numpy()
+    rgb = img_tensor[rgb_indices].permute(1, 2, 0).cpu().numpy()
+    p2, p98 = np.percentile(rgb, [2, 98])
+    return np.clip((rgb - p2) / (p98 - p2 + 1e-8), 0, 1)
+
+def visualize_predictions(models, dataset, device, output_dir, n_samples=5):
     """Generate comprehensive comparison for all trained models across samples"""
     if not models:
         print("⚠️ No models available for visualization.")
         return
 
-    print(f"\nGenerating all-model comparison (3 samples, {len(models) + 5} columns)...")
+    print(f"\nGenerating all-model comparison ({n_samples} samples, {len(models) + 5} columns)...")
 
     # We need 5 columns for inputs/GT + 1 column for each model
     n_cols = 5 + len(models)
@@ -389,22 +408,22 @@ def visualize_predictions(models, dataset, device, output_dir, n_samples=3):
     # Ensure axes is 2D even if n_samples=1
     if n_samples == 1:
         axes = axes.reshape(1, -1)
-
-    for i in range(min(n_samples, len(dataset))):
-        s1, s2_cloudy, s2_clean, cloud_mask = dataset[i+1500]
+    sample_indices = random.sample(range(len(dataset)), min(n_samples, len(dataset)))
+    #for i in range(min(n_samples, len(dataset))): < for static sample
+    for i, idx in enumerate(sample_indices):
+        s1, s2_cloudy, s2_clean, cloud_mask = dataset[idx]
         model_input = torch.cat([s1, s2_cloudy], dim=0).unsqueeze(0).to(device)
 
         # Common visualizations - FIXED: Using indices [3, 2, 1] for RGB (B4, B3, B2)
         # Added a 5x multiplier for basic visibility, better than black
-        cloudy_rgb = np.clip(s2_cloudy[[3, 2, 1]].permute(1, 2, 0).cpu().numpy() * 5, 0, 1)
-        clean_rgb = np.clip(s2_clean[[3, 2, 1]].permute(1, 2, 0).cpu().numpy() * 5, 0, 1)
+        cloudy_rgb = get_stretched_rgb(s2_cloudy)
+        clean_rgb = get_stretched_rgb(s2_clean)
         s1_viz = s1[0].cpu().numpy()
         mask_viz = cloud_mask[0].cpu().numpy()
         diff_viz = np.clip(np.abs(cloudy_rgb - clean_rgb) * 2, 0, 1)  # Boost diff visibility
 
         # --- Input Columns ---
         axes[i, 0].imshow(cloudy_rgb)
-        axes[i, 0].imshow(np.clip(cloudy_rgb, 0, 1))
         axes[i, 0].set_title('1. Cloudy Input' if i == 0 else '')
 
         axes[i, 1].imshow(s1_viz, cmap='gray')
@@ -428,7 +447,7 @@ def visualize_predictions(models, dataset, device, output_dir, n_samples=3):
 
                 pred = model(input_tensor)
                 # FIXED: Using indices [3, 2, 1] for RGB and applying visibility boost
-                pred_rgb = np.clip(pred[0, [3, 2, 1]].cpu().permute(1, 2, 0).numpy() * 5, 0, 1)
+                pred_rgb = get_stretched_rgb(pred[0])
 
                 col_idx = 5 + j
                 axes[i, col_idx].imshow(pred_rgb)
@@ -451,20 +470,22 @@ def visualize_dataset_samples(dataset, output_dir, n_samples=3):
     fig, axes = plt.subplots(n_samples, 4, figsize=(16, 4 * n_samples))
     if n_samples == 1:
         axes = axes.reshape(1, -1)
+    sample_indices = random.sample(range(len(dataset)), min(n_samples, len(dataset)))
 
-    for i in range(min(n_samples, len(dataset))):
-        s1, s2_cloudy, s2_clean, cloud_mask = dataset[1000+i]
+    #for i in range(min(n_samples, len(dataset))): < for static samples
+    for i, idx in enumerate(sample_indices):
+        s1, s2_cloudy, s2_clean, cloud_mask = dataset[idx]
 
         # RGB extraction (bands B04,B03,B02 = indices 3, 2, 1)
         # Added visibility boost (* 5)
-        cloudy_rgb = np.clip(s2_cloudy[[3, 2, 1]].permute(1, 2, 0).numpy() * 5, 0, 1)
-        clean_rgb = np.clip(s2_clean[[3, 2, 1]].permute(1, 2, 0).numpy() * 5, 0, 1)
+        cloudy_rgb = get_stretched_rgb(s2_cloudy)
+        clean_rgb = get_stretched_rgb(s2_clean)
 
         axes[i, 0].imshow(cloudy_rgb)
         axes[i, 0].set_title('S2 Cloudy (RGB)')
         axes[i, 0].axis('off')
 
-        axes[i, 1].imshow(np.clip(clean_rgb, 0, 1))
+        axes[i, 1].imshow(clean_rgb)
         axes[i, 1].set_title('S2 Clean (RGB)')
         axes[i, 1].axis('off')
 
@@ -585,7 +606,7 @@ def main():
         print(f"  Cloud Mask - mean coverage: {cloud_mask.mean():.2%}")
     # Visualize dataset
     visualize_dataset_samples(val_dataset, Config.OUTPUT_DIR, n_samples=3)
-
+    return 0
     # ==================== TRAIN MODELS ====================
     print("\n### STEP 2: Training Models ###")
 

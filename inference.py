@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import torch
 import rasterio
-from NN_models import UNet, SimpleCNN, Generator
+from Models import UNet, SimpleCNN, Generator
 
 
 class SingleImageInference:

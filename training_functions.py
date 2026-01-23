@@ -3,9 +3,17 @@ import torch.nn as nn
 from sklearn.model_selection import KFold
 from torch import optim
 from torch.utils.data import Dataset, DataLoader
-from NN_models import UNet, DiffusionModel, SimpleCNN, Generator, LSTMCloudRemover, Discriminator
 from collections import defaultdict
-
+from Models import (
+    UNet,
+    DiffusionModel,
+    SimpleCNN,
+    Generator,
+    LSTMCloudRemover,
+    Discriminator,
+    RandomForestCloudRemover,
+    RandomForestWrapper
+)
 
 class EarlyStopping:
     """Early stopping to prevent overfitting"""
@@ -205,7 +213,7 @@ class ModelTrainer:
                                   out_channels=out_channels).to(self.device)
             elif self.model_type == 'GAN':
                 model = self._train_gan_fold(train_loader, val_loader, epochs, lr,
-                                             patience, use_amp, in_channels, out_channels)
+                                             patience, use_amp, in_channels)
                 self.models.append(model)
                 continue
             elif self.model_type == 'LSTM':
@@ -214,6 +222,11 @@ class ModelTrainer:
                 model = self._train_diffusion_fold(train_loader, val_loader, epochs,
                                                    lr, patience, use_amp, in_channels)
                 self.models.append(model)
+                continue
+            elif self.model_type == 'RandomForest':
+                model, history = self._train_rf_fold(train_loader, val_loader)
+                self.models.append(model)
+                self.histories.append(history)
                 continue
             else:
                 raise ValueError(f"Unknown model type: {self.model_type}")
@@ -470,6 +483,52 @@ class ModelTrainer:
         early_stopping.load_best_model(model)
         return model
 
+    def _train_rf_fold(self, train_loader, val_loader):
+        """Train Random Forest for single fold"""
+        print("\nTraining Random Forest model...")
+        import time
+        start_time = time.time()
+        rf = RandomForestCloudRemover(
+            n_estimators=200,
+            max_depth=15,
+            #patch_size=5,
+        )
+
+        # Train on subset of training data
+        rf.fit(train_loader, device=self.device, max_samples=100000)
+
+        # Validate
+        print("\nValidating Random Forest...")
+        val_loss = 0
+        n_batches = 0
+
+        for s1, s2_cloudy, s2_clean, cloud_mask in val_loader:
+            s1 = s1.to(self.device)
+            s2_cloudy = s2_cloudy.to(self.device)
+            s2_clean = s2_clean.to(self.device)
+            cloud_mask = cloud_mask.to(self.device)
+
+            # Predict
+            pred = rf.predict(s1, s2_cloudy, cloud_mask, device=self.device)
+            pred = pred.to(self.device)
+
+            # Calculate loss
+            loss = nn.functional.mse_loss(pred, s2_clean)
+            val_loss += loss.item()
+            n_batches += 1
+
+            if n_batches >= 10:  # Limit validation for speed
+                break
+
+        val_loss /= n_batches
+        print(f"Random Forest Validation Loss: {val_loss:.6f}")
+        history = {
+            'train_loss': [],
+            'val_loss': [val_loss],
+            'epoch_times': [time.time() - start_time]
+        }
+        model = RandomForestWrapper(rf)
+        return model, history
 
 class DiffusionTrainer:
     """Trainer for Diffusion Model"""

@@ -2,6 +2,7 @@
 import torch.nn as nn
 import torch
 import numpy as np
+from sklearn.ensemble import RandomForestRegressor
 # Model 1: Deep CNN (U-Net architecture)
 class UNet(nn.Module):
     """U-Net architecture for image-to-image translation"""
@@ -393,4 +394,186 @@ class ResBlock(nn.Module):
         h = h + emb_out
         h = self.out_layers(h)
         return self.skip_connection(x) + h
+
+
+class RandomForestCloudRemover:
+    """
+    Random Forest model for cloud removal using S1 and S2 data.
+    Trains on pixel-level data to predict clean S2 values from S1 and cloudy S2.
+    """
+
+    def __init__(self, n_estimators=100, max_depth=10, random_state=42):
+        self.model = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=-1
+        )
+        self.is_fitted = False
+
+    def _prepare_features(self, s1, s2_cloudy, cloud_mask):
+        """
+        Flattens spatial data into pixel-wise feature vectors.
+        Features: S1 bands + S2 cloudy bands + cloud_mask
+        """
+        # Convert to numpy if they are tensors
+        if isinstance(s1, torch.Tensor):
+            s1 = s1.cpu().numpy()
+        if isinstance(s2_cloudy, torch.Tensor):
+            s2_cloudy = s2_cloudy.cpu().numpy()
+        if isinstance(cloud_mask, torch.Tensor):
+            cloud_mask = cloud_mask.cpu().numpy()
+
+        # Reshape from [B, C, H, W] to [B*H*W, C]
+        if len(s1.shape) == 4:
+            b, c1, h, w = s1.shape
+            c2 = s2_cloudy.shape[1]
+            cm = cloud_mask.shape[1]
+            s1_flat = s1.transpose(0, 2, 3, 1).reshape(-1, c1)
+            s2_flat = s2_cloudy.transpose(0, 2, 3, 1).reshape(-1, c2)
+            mask_flat = cloud_mask.transpose(0, 2, 3, 1).reshape(-1, cm)
+        else:
+            c1, h, w = s1.shape
+            c2 = s2_cloudy.shape[0]
+            cm = cloud_mask.shape[0]
+            b = 1
+            s1_flat = s1.transpose(1, 2, 0).reshape(-1, c1)
+            s2_flat = s2_cloudy.transpose(1, 2, 0).reshape(-1, c2)
+            mask_flat = cloud_mask.transpose(1, 2, 0).reshape(-1, cm)
+
+        # Concatenate features: [S1, S2_cloudy, Mask]
+        features = np.hstack([s1_flat, s2_flat, mask_flat])
+        return features, (b, h, w)
+
+    def fit(self, train_loader, device='cpu', max_samples=100000):
+        """
+        Trains the RF model by sampling pixels from the train_loader.
+
+        Args:
+            train_loader: PyTorch DataLoader
+            device: computation device
+            max_samples: Maximum number of pixels to train on (prevents OOM)
+        """
+        X_list = []
+        y_list = []
+        samples_collected = 0
+
+        print(f"Collecting training pixels (target: {max_samples})...")
+
+        for s1, s2_cloudy, s2_clean, cloud_mask in train_loader:
+            # Prepare features and targets for this batch
+            X_batch, _ = self._prepare_features(s1, s2_cloudy, cloud_mask)
+
+            c_target = s2_clean.shape[1]
+            y_batch = s2_clean.cpu().numpy().transpose(0, 2, 3, 1).reshape(-1, c_target)
+
+            X_list.append(X_batch)
+            y_list.append(y_batch)
+
+            samples_collected += X_batch.shape[0]
+            if samples_collected >= max_samples:
+                break
+
+        # Combine all collected batches
+        X = np.vstack(X_list)[:max_samples]
+        y = np.vstack(y_list)[:max_samples]
+
+        print(f"Fitting RandomForest on {X.shape[0]} pixels...")
+        self.model.fit(X, y)
+        self.is_fitted = True
+        print("✓ RandomForest fitting complete")
+
+    def predict(self, s1, s2_cloudy, cloud_mask, device='cpu'):
+        """Predict clean S2 from cloudy S2 + S1 + Mask"""
+        features, (b, h, w) = self._prepare_features(s1, s2_cloudy, cloud_mask)
+
+        # Verify feature count against the trained model
+        if hasattr(self.model, "n_features_in_"):
+            expected = self.model.n_features_in_
+            if features.shape[1] != expected:
+                # If there's a mismatch, we likely missed the cloud mask or have extra bands
+                if features.shape[1] < expected:
+                    # Fill missing features with zeros (usually the mask if it was excluded)
+                    padding = np.zeros((features.shape[0], expected - features.shape[1]))
+                    features = np.hstack([features, padding])
+                else:
+                    features = features[:, :expected]
+
+        y_pred = self.model.predict(features)
+
+        # Reshape back to [B, C, H, W]
+        c_out = y_pred.shape[1]
+        return torch.from_numpy(
+            y_pred.reshape(b, h, w, c_out).transpose(0, 3, 1, 2)
+        ).float().to(device)
+
+class RandomForestWrapper(nn.Module):
+    """
+    PyTorch-compatible wrapper for RandomForestCloudRemover
+    Allows RF to be used alongside neural networks in evaluation pipeline
+    """
+
+    def __init__(self, rf_model):
+        """
+        Args:
+            rf_model: RandomForestCloudRemover instance
+        """
+        super(RandomForestWrapper, self).__init__()
+        self.rf_model = rf_model
+        self._device = 'cpu'
+
+    def predict(self, s1, s2_cloudy, cloud_mask, device='cpu'):
+        """Compatibility method for evaluation pipeline"""
+        return self.rf_model.predict(s1, s2_cloudy, cloud_mask, device=device)
+    def forward(self, x):
+        """
+        Forward pass compatible with PyTorch models
+
+        Args:
+            x: Concatenated input [B, C_total, H, W]
+               where C_total = C_s1 + C_s2 + 1 (S1 + S2 + mask)
+
+        Returns:
+            output: [B, C_s2, H, W] predicted clean S2
+        """
+        # Split input into components
+        # Assuming: x = [s1 (2 bands), s2_cloudy (4-13 bands), cloud_mask (1 band)]
+        C_s1 = 2  # S1 always 2 bands (VV, VH)
+        C_total = x.shape[1]
+
+        s1 = x[:, :C_s1, :, :]
+        cloud_mask = x[:, -1:, :, :]  # Last channel is mask
+        s2_cloudy = x[:, C_s1:-1, :, :]  # Middle channels are S2
+
+        # Use RF model to predict
+        output = self.rf_model.predict(s1, s2_cloudy, cloud_mask, device=self._device)
+
+        return output
+
+    def to(self, device):
+        """Move to device (compatibility)"""
+        self._device = device if isinstance(device, str) else str(device)
+        return self
+
+    def eval(self):
+        """Set to eval mode (compatibility)"""
+        return self
+
+    def train(self, mode=True):
+        """Set to train mode (compatibility)"""
+        return self
+
+
+def integrate_rf_with_pipeline(rf_model):
+    """
+    Helper function to wrap RF model for pipeline integration
+
+    Args:
+        rf_model: Trained RandomForestCloudRemover
+
+    Returns:
+        wrapped_model: PyTorch-compatible wrapper
+    """
+    return RandomForestWrapper(rf_model)
+
 

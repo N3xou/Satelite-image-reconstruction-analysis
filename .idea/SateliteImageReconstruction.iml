@@ -6,6 +6,9 @@
       <excludeFolder url="file://$MODULE_DIR$/satellite_data" />
       <excludeFolder url="file://$MODULE_DIR$/sen12mscr_dataset" />
       <excludeFolder url="file://$MODULE_DIR$/whus2cr_dataset" />
+      <excludeFolder url="file://$MODULE_DIR$/diagnostics" />
+      <excludeFolder url="file://$MODULE_DIR$/inference_output" />
+      <excludeFolder url="file://$MODULE_DIR$/quick_test" />
     </content>
     <orderEntry type="jdk" jdkName="Python 3.13 (AnalizaDanychPrzestrzennychApp)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
