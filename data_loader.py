@@ -15,7 +15,7 @@ import tarfile
 from sklearn.model_selection import train_test_split
 from enum import Enum
 import warnings
-from collections import defaultdict
+from cloud_detection import compute_deep_cloud_mask
 from tqdm import tqdm
 warnings.filterwarnings('ignore')
 

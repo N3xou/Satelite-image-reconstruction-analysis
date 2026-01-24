@@ -19,6 +19,7 @@ from synthetic_data_generator import SatelliteDatasetPreparer
 import warnings
 from data_loader import SEN12MSCRDataset
 from training_functions import ModelTrainer
+from Visualization import visualize_dataset_samples,visualize_predictions
 import time
 warnings.filterwarnings('ignore')
 
@@ -37,7 +38,8 @@ class Config:
     S2_BANDS = list(range(1, 14))
     PATCH_SIZE = 256
     DATA_FRACTION = 0.05 # Use 5% of data for quick training
-
+    min_cloud_fraction = 0.05
+    max_cloud_fraction = 0.7
     # Training
     BATCH_SIZE = 4
     EPOCHS = 3
@@ -380,129 +382,6 @@ class ModelEvaluator:
         print(f"{'=' * 70}")
 
 
-def get_stretched_rgb(img_tensor):
-    # RGB needs indices [3, 2, 1] for B04, B03, B02
-    n_bands = img_tensor.shape[0]
-    if n_bands >= 13:
-        rgb_indices = [3, 2, 1]
-    elif n_bands >= 3:
-        rgb_indices = [2, 1, 0]
-    else:
-        return img_tensor[0].cpu().numpy()
-    rgb = img_tensor[rgb_indices].permute(1, 2, 0).cpu().numpy()
-    p2, p98 = np.percentile(rgb, [2, 98])
-    return np.clip((rgb - p2) / (p98 - p2 + 1e-8), 0, 1)
-
-def visualize_predictions(models, dataset, device, output_dir, n_samples=5):
-    """Generate comprehensive comparison for all trained models across samples"""
-    if not models:
-        print("⚠️ No models available for visualization.")
-        return
-
-    print(f"\nGenerating all-model comparison ({n_samples} samples, {len(models) + 5} columns)...")
-
-    # We need 5 columns for inputs/GT + 1 column for each model
-    n_cols = 5 + len(models)
-    fig, axes = plt.subplots(n_samples, n_cols, figsize=(4 * n_cols, 4 * n_samples))
-
-    # Ensure axes is 2D even if n_samples=1
-    if n_samples == 1:
-        axes = axes.reshape(1, -1)
-    sample_indices = random.sample(range(len(dataset)), min(n_samples, len(dataset)))
-    #for i in range(min(n_samples, len(dataset))): < for static sample
-    for i, idx in enumerate(sample_indices):
-        s1, s2_cloudy, s2_clean, cloud_mask = dataset[idx]
-        model_input = torch.cat([s1, s2_cloudy], dim=0).unsqueeze(0).to(device)
-
-        # Common visualizations - FIXED: Using indices [3, 2, 1] for RGB (B4, B3, B2)
-        # Added a 5x multiplier for basic visibility, better than black
-        cloudy_rgb = get_stretched_rgb(s2_cloudy)
-        clean_rgb = get_stretched_rgb(s2_clean)
-        s1_viz = s1[0].cpu().numpy()
-        mask_viz = cloud_mask[0].cpu().numpy()
-        diff_viz = np.clip(np.abs(cloudy_rgb - clean_rgb) * 2, 0, 1)  # Boost diff visibility
-
-        # --- Input Columns ---
-        axes[i, 0].imshow(cloudy_rgb)
-        axes[i, 0].set_title('1. Cloudy Input' if i == 0 else '')
-
-        axes[i, 1].imshow(s1_viz, cmap='gray')
-        axes[i, 1].set_title('2. S1 (SAR)' if i == 0 else '')
-
-        axes[i, 2].imshow(mask_viz, cmap='hot')
-        axes[i, 2].set_title('3. Cloud Mask' if i == 0 else '')
-
-        axes[i, 3].imshow(np.clip(diff_viz, 0, 1))
-        axes[i, 3].set_title('4. Difference' if i == 0 else '')
-
-        axes[i, 4].imshow(np.clip(clean_rgb, 0, 1))
-        axes[i, 4].set_title('5. Ground Truth' if i == 0 else '')
-
-        # --- Model Output Columns ---
-        for j, (model_name, model) in enumerate(models.items()):
-            model.eval()
-            with torch.no_grad():
-                # Handle LSTM special shape if needed
-                input_tensor = model_input.unsqueeze(1) if 'LSTM' in model_name else model_input
-
-                pred = model(input_tensor)
-                # FIXED: Using indices [3, 2, 1] for RGB and applying visibility boost
-                pred_rgb = get_stretched_rgb(pred[0])
-
-                col_idx = 5 + j
-                axes[i, col_idx].imshow(pred_rgb)
-                axes[i, col_idx].set_title(f'Output: {model_name}' if i == 0 else '')
-
-        for ax in axes[i]:
-            ax.axis('off')
-
-    plt.tight_layout()
-    plot_path = output_dir / 'all_models_comparison.png'
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"✓ Saved multi-model comparison: {plot_path}")
-
-
-def visualize_dataset_samples(dataset, output_dir, n_samples=3):
-    """Visualize dataset samples"""
-    print(f"\nVisualizing dataset samples...")
-
-    fig, axes = plt.subplots(n_samples, 4, figsize=(16, 4 * n_samples))
-    if n_samples == 1:
-        axes = axes.reshape(1, -1)
-    sample_indices = random.sample(range(len(dataset)), min(n_samples, len(dataset)))
-
-    #for i in range(min(n_samples, len(dataset))): < for static samples
-    for i, idx in enumerate(sample_indices):
-        s1, s2_cloudy, s2_clean, cloud_mask = dataset[idx]
-
-        # RGB extraction (bands B04,B03,B02 = indices 3, 2, 1)
-        # Added visibility boost (* 5)
-        cloudy_rgb = get_stretched_rgb(s2_cloudy)
-        clean_rgb = get_stretched_rgb(s2_clean)
-
-        axes[i, 0].imshow(cloudy_rgb)
-        axes[i, 0].set_title('S2 Cloudy (RGB)')
-        axes[i, 0].axis('off')
-
-        axes[i, 1].imshow(clean_rgb)
-        axes[i, 1].set_title('S2 Clean (RGB)')
-        axes[i, 1].axis('off')
-
-        axes[i, 2].imshow(cloud_mask[0].numpy(), cmap='hot', vmin=0, vmax=1)
-        axes[i, 2].set_title('Cloud Mask')
-        axes[i, 2].axis('off')
-
-        diff = np.abs(cloudy_rgb - clean_rgb)
-        axes[i, 3].imshow(diff)
-        axes[i, 3].set_title('Difference')
-        axes[i, 3].axis('off')
-
-    plt.tight_layout()
-    plot_path = output_dir / 'dataset_samples.png'
-    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    print(f"✓ Saved dataset samples: {plot_path}")
 # ==================== MAIN EXECUTION ====================
 
 def main():
@@ -532,8 +411,8 @@ def main():
             s2_bands=Config.S2_BANDS,
             patch_size=Config.PATCH_SIZE,
             data_fraction=Config.DATA_FRACTION,
-            min_cloud_fraction=0.05,
-            max_cloud_fraction=0.95,
+            min_cloud_fraction=Config.min_cloud_fraction,
+            max_cloud_fraction=Config.max_cloud_fraction,
             random_seed=42
         )
 
@@ -605,8 +484,7 @@ def main():
         print(f"  S2 Clean  - min: {s2_clean.min():.4f}, max: {s2_clean.max():.4f}, mean: {s2_clean.mean():.4f}")
         print(f"  Cloud Mask - mean coverage: {cloud_mask.mean():.2%}")
     # Visualize dataset
-    visualize_dataset_samples(val_dataset, Config.OUTPUT_DIR, n_samples=3)
-    return 0
+    visualize_dataset_samples(full_dataset, Config.OUTPUT_DIR, n_samples=3)
     # ==================== TRAIN MODELS ====================
     print("\n### STEP 2: Training Models ###")
 
