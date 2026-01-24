@@ -37,11 +37,11 @@ class Config:
     SEASONS = None  # None = all seasons
     S2_BANDS = list(range(1, 14))
     PATCH_SIZE = 256
-    DATA_FRACTION = 0.05 # Use 5% of data for quick training
-    min_cloud_fraction = 0.05
+    DATA_FRACTION = 0.15 # Use 5% of data for quick training
+    min_cloud_fraction = 0.1
     max_cloud_fraction = 0.7
     # Training
-    BATCH_SIZE = 4
+    BATCH_SIZE = 6
     EPOCHS = 3
     LEARNING_RATE = 0.001
     PATIENCE = 7
@@ -49,8 +49,8 @@ class Config:
     NUM_WORKERS = 4
 
     # Models to train
-    MODELS = ['RandomForest']
-    #MODELS = ['SimpleCNN', 'UNet', 'GAN']  # Fast models for demo
+    #MODELS = ['SimpleCNN']
+    MODELS = ['SimpleCNN', 'UNet', 'RandomForest']  # Fast models for demo
     # MODELS = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']  # All models
 
     # Output
@@ -389,12 +389,14 @@ def main():
 
     print(f"\nConfiguration:")
     print(f"  Dataset:         {Config.DATASET_ROOT}")
-    print(f"  Bands:           {len(Config.S2_BANDS)} (RGB + NIR)")
+    print(f"  Bands:           {len(Config.S2_BANDS)}")
     print(f"  Data Fraction:   {Config.DATA_FRACTION * 100:.0f}%")
     print(f"  Patch Size:      {Config.PATCH_SIZE}x{Config.PATCH_SIZE}")
     print(f"  Batch Size:      {Config.BATCH_SIZE}")
     print(f"  Epochs:          {Config.EPOCHS}")
     print(f"  Models:          {', '.join(Config.MODELS)}")
+    print(f"min_cloud_fraction: {Config.min_cloud_fraction:.2%}")
+    print(f"max_cloud_fraction: {Config.max_cloud_fraction:.2%}")
     print("=" * 70)
 
     # Create output directory
@@ -508,7 +510,7 @@ def main():
             trainer = ModelTrainer(model_name, device=device)
             models, histories = trainer.train_kfold(
                 dataset=train_dataset,
-                k=2,
+                k=4,
                 epochs=Config.EPOCHS,
                 batch_size=Config.BATCH_SIZE,
                 lr=Config.LEARNING_RATE,
@@ -608,6 +610,11 @@ def main():
 if __name__ == '__main__':
     main()
 
-# TODO: Redukcja wymiarowosci
-# TODO: Wykrywanie chmur modelem
-# TODO: Testing self supervised learning (partly clear imaes, no ground truth)
+# NOTES
+#
+# funkcja straty ?
+# 1 model do wykrywania i rekonstrukcji vs 2 modele (wykrywanie / rekonstrukcja) nauka na tylko czystych obrazach?
+# Redukcja wymiarowosci pasm
+#  Wykrywanie chmur ML
+#  Testing self supervised learning (partly clear imaes, no ground truth)
+# https://www.sciencedirect.com/science/article/pii/S2667393223000157

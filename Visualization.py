@@ -82,8 +82,9 @@ def visualize_predictions(models, dataset, device, output_dir, n_samples=5):
             cloudy_rgb = s2_cloudy[:3].permute(1, 2, 0).numpy()
             clean_rgb = s2_clean[:3].permute(1, 2, 0).numpy()
 
-        p2, p98 = np.percentile(cloudy_rgb, [2, 98])
+        p2, p98 = np.percentile(cloudy_rgb, [5, 95])
         cloudy_stretched = np.clip((cloudy_rgb - p2) / (p98 - p2), 0, 1)
+        p2, p98 = np.percentile(clean_rgb, [5, 95])
         clean_stretched = np.clip((clean_rgb - p2) / (p98 - p2), 0, 1)
 
 
@@ -121,6 +122,7 @@ def visualize_predictions(models, dataset, device, output_dir, n_samples=5):
                     pred_rgb = pred_img[rgb_indices].permute(1, 2, 0).numpy()
                 else:
                     pred_rgb = pred_img[0].numpy()
+                p2, p98 = np.percentile(pred_rgb, [5, 95])
                 pred_stretched = np.clip((pred_rgb - p2) / (p98 - p2), 0, 1)
                 col_idx = 5 + j
                 axes[i, col_idx].imshow(pred_stretched)

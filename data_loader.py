@@ -15,7 +15,6 @@ import tarfile
 from sklearn.model_selection import train_test_split
 from enum import Enum
 import warnings
-from cloud_detection import compute_deep_cloud_mask
 from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
@@ -197,13 +196,17 @@ class SEN12MSCRDataset(Dataset):
         data_fraction=1.0,
         min_cloud_fraction=0.05,
         max_cloud_fraction=0.9,
-        random_seed=42
+        random_seed=42,
+        cloud_mask_mode: str = "simple",
+        deep_model_kwargs: dict | None = None
     ):
         self.root_dir = Path(root_dir)
         self.patch_size = patch_size
         self.min_cloud_fraction = min_cloud_fraction
         self.max_cloud_fraction = max_cloud_fraction
         self.rng = random.Random(random_seed)
+        self.cloud_mask_mode = cloud_mask_mode
+        self.deep_model_kwargs = deep_model_kwargs or {}
 
         # Seasons
         if seasons is None:
@@ -354,7 +357,7 @@ class SEN12MSCRDataset(Dataset):
         s2_cloudy = self.normalize_s2(s2_cloudy)
         s2_clean = self.normalize_s2(s2_clean)
 
-        # Cloud mask
+
         cloud_mask = self.compute_cloud_mask(s1, s2_cloudy)
 
         # Random crop
