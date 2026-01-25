@@ -785,7 +785,22 @@ class SelfSupervisedTrainer:
         print("\n" + "=" * 70)
         print("STAGE 3: JOINT CLOUD DETECTION + RECONSTRUCTION")
         print("=" * 70)
+        if self.pretrain_model is None:
+            # We assume the default output directory structure
+            checkpoint_path = Path("results/selfsupervised/pretrain_best.pth")
+            if not checkpoint_path.exists():
+                # Fallback to current directory if not in results
+                checkpoint_path = Path("pretrain_best.pth")
 
+            if checkpoint_path.exists():
+                print(f"Restoring pretrained model from {checkpoint_path}...")
+                self.pretrain_model = MaskedMultispectralAutoencoder(self.config).to(self.device)
+                self.pretrain_model.load_state_dict(torch.load(checkpoint_path, map_location=self.device))
+            else:
+                raise RuntimeError(
+                    "Stage 3 requires a pretrained model. Run Stage 1 first or "
+                    "ensure 'pretrain_best.pth' exists."
+                )
         # Initialize joint model
         self.joint_model = JointCloudModel(self.config).to(self.device)
 
@@ -877,76 +892,76 @@ class SelfSupervisedTrainer:
 
         return total_loss / len(loader)
 
-def _validate_joint_epoch(self, loader, pseudo_labels):
-    """Validation epoch for joint model"""
-    self.joint_model.eval()
-    total_loss = 0
+    def _validate_joint_epoch(self, loader, pseudo_labels):
+        """Validation epoch for joint model"""
+        self.joint_model.eval()
+        total_loss = 0
 
-    with torch.no_grad():
-        for batch_idx, data in enumerate(loader):
-            if len(data) == 4:
-                s1, s2_cloudy, s2_clean, _ = data
-            else:
-                s2_cloudy, s2_clean = data
-                s1 = None
+        with torch.no_grad():
+            for batch_idx, data in enumerate(loader):
+                if len(data) == 4:
+                    s1, s2_cloudy, s2_clean, _ = data
+                else:
+                    s2_cloudy, s2_clean = data
+                    s1 = None
 
-            s2_cloudy = s2_cloudy.to(self.device)
-            s2_clean = s2_clean.to(self.device)
+                s2_cloudy = s2_cloudy.to(self.device)
+                s2_clean = s2_clean.to(self.device)
 
+                if self.config.use_s1 and s1 is not None:
+                    s1 = s1.to(self.device)
+                    x = torch.cat([s2_cloudy, s1], dim=1)
+                else:
+                    x = s2_cloudy
+
+                batch_start = batch_idx * loader.batch_size
+                batch_pseudo = torch.from_numpy(
+                    np.stack(pseudo_labels[batch_start:batch_start + x.shape[0]])
+                ).to(self.device)
+
+                cloud_prob, reconstructed, _ = self.joint_model(x)
+
+                target_dict = {
+                    's2_clean': s2_clean,
+                    'cloud_mask': batch_pseudo,
+                    'mask_region': batch_pseudo > 0.3
+                }
+
+                pred_dict = {
+                    'cloud_prob': cloud_prob,
+                    'reconstructed': reconstructed
+                }
+
+                losses = self.criterion(pred_dict, target_dict)
+                total_loss += losses['total'].item()
+
+        return total_loss / len(loader)
+
+    def inference(self, s1, s2_cloudy):
+        """
+        Inference pipeline
+
+        Args:
+            s1: (B, 2, H, W) or None
+            s2_cloudy: (B, 13, H, W)
+
+        Returns:
+            cloud_mask: (B, 1, H, W)
+            reconstructed: (B, 13, H, W)
+        """
+        self.joint_model.eval()
+
+        with torch.no_grad():
+            # Prepare input
             if self.config.use_s1 and s1 is not None:
-                s1 = s1.to(self.device)
                 x = torch.cat([s2_cloudy, s1], dim=1)
             else:
                 x = s2_cloudy
 
-            batch_start = batch_idx * loader.batch_size
-            batch_pseudo = torch.from_numpy(
-                np.stack(pseudo_labels[batch_start:batch_start + x.shape[0]])
-            ).to(self.device)
-
+            # Forward
             cloud_prob, reconstructed, _ = self.joint_model(x)
 
-            target_dict = {
-                's2_clean': s2_clean,
-                'cloud_mask': batch_pseudo,
-                'mask_region': batch_pseudo > 0.3
-            }
-
-            pred_dict = {
-                'cloud_prob': cloud_prob,
-                'reconstructed': reconstructed
-            }
-
-            losses = self.criterion(pred_dict, target_dict)
-            total_loss += losses['total'].item()
-
-    return total_loss / len(loader)
-
-def inference(self, s1, s2_cloudy):
-    """
-    Inference pipeline
-
-    Args:
-        s1: (B, 2, H, W) or None
-        s2_cloudy: (B, 13, H, W)
-
-    Returns:
-        cloud_mask: (B, 1, H, W)
-        reconstructed: (B, 13, H, W)
-    """
-    self.joint_model.eval()
-
-    with torch.no_grad():
-        # Prepare input
-        if self.config.use_s1 and s1 is not None:
-            x = torch.cat([s2_cloudy, s1], dim=1)
-        else:
-            x = s2_cloudy
-
-        # Forward
-        cloud_prob, reconstructed, _ = self.joint_model(x)
-
-    return cloud_prob, reconstructed
+        return cloud_prob, reconstructed
 def compute_selfsupervised_cloud_mask(s1, s2_cloudy, model_path, config, device='cuda'):
     """
     Args:
@@ -993,7 +1008,7 @@ def compute_selfsupervised_cloud_mask(s1, s2_cloudy, model_path, config, device=
     reconstructed = reconstructed[0].cpu().numpy()
 
     return cloud_mask, reconstructed
-# ... existing code ...
+
 import argparse
 from pathlib import Path
 
@@ -1001,8 +1016,6 @@ import torch
 from torch.utils.data import DataLoader, random_split
 
 from data_loader import SEN12MSCRDataset
-
-# ... existing code ...
 
 
 def _build_loaders(
@@ -1163,8 +1176,8 @@ if __name__ == "__main__":
     parser.add_argument("--all", action="store_true", help="Run all stages in order")
 
     # Lightweight config overrides
-    parser.add_argument("--epochs-pretrain", type=int, default=50)
-    parser.add_argument("--epochs-reconstruction", type=int, default=100)
+    parser.add_argument("--epochs-pretrain", type=int, default=3)
+    parser.add_argument("--epochs-reconstruction", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--patch-size", type=int, default=256)
     parser.add_argument("--encoder-type", type=str, default="unet", choices=["unet", "vit", "hybrid"])
