@@ -787,7 +787,7 @@ class SelfSupervisedTrainer:
         print("=" * 70)
         if self.pretrain_model is None:
             # We assume the default output directory structure
-            checkpoint_path = Path("results/selfsupervised/pretrain_best.pth")
+            checkpoint_path = Path("../results/selfsupervised/pretrain_best.pth")
             if not checkpoint_path.exists():
                 # Fallback to current directory if not in results
                 checkpoint_path = Path("pretrain_best.pth")

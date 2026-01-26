@@ -213,14 +213,14 @@ class ModelTrainer:
                                   out_channels=out_channels).to(self.device)
             elif self.model_type == 'GAN':
                 model = self._train_gan_fold(train_loader, val_loader, epochs, lr,
-                                             patience, use_amp, in_channels)
+                                             patience, use_amp, in_channels, out_channels)
                 self.models.append(model)
                 continue
             elif self.model_type == 'LSTM':
                 model = LSTMCloudRemover(in_channels=in_channels).to(self.device)
             elif self.model_type == 'Diffusion':
                 model = self._train_diffusion_fold(train_loader, val_loader, epochs,
-                                                   lr, patience, use_amp, in_channels)
+                                                   lr, patience, use_amp, in_channels, out_channels)
                 self.models.append(model)
                 continue
             elif self.model_type == 'RandomForest':
@@ -345,10 +345,10 @@ class ModelTrainer:
 
         return history
 
-    def _train_gan_fold(self, train_loader, val_loader, epochs, lr, patience, use_amp, n_channels):
+    def _train_gan_fold(self, train_loader, val_loader, epochs, lr, patience, use_amp, n_channels, out_channels):
         """Train GAN for single fold with early stopping"""
-        generator = Generator(in_channels=n_channels, out_channels=n_channels).to(self.device)
-        discriminator = Discriminator(in_channels=n_channels * 2).to(self.device)
+        generator = Generator(in_channels=n_channels, out_channels=out_channels).to(self.device)
+        discriminator = Discriminator(in_channels=out_channels * 2).to(self.device)
 
         criterion_gan = nn.BCEWithLogitsLoss()
         criterion_l1 = nn.L1Loss()
@@ -365,9 +365,13 @@ class ModelTrainer:
             discriminator.train()
 
             for s1, s2_cloudy, s2_clean, cloud_mask in train_loader:
+                s1 = s1.to(self.device)
                 s2_cloudy = s2_cloudy.to(self.device)
                 s2_clean = s2_clean.to(self.device)
                 batch_size = s2_cloudy.size(0)
+
+                # Concatenate S1 and S2 for generator input
+                model_input = torch.cat([s1, s2_cloudy], dim=1)
 
                 # Labels for discriminator
                 real_label = torch.ones(batch_size, 1, 30, 30).to(self.device)
@@ -378,7 +382,7 @@ class ModelTrainer:
 
                 if use_amp and scaler_d is not None:
                     with torch.cuda.amp.autocast():
-                        fake_clean = generator(s2_cloudy)
+                        fake_clean = generator(model_input)
                         real_loss = criterion_gan(discriminator(s2_cloudy, s2_clean), real_label)
                         fake_loss = criterion_gan(discriminator(s2_cloudy, fake_clean.detach()), fake_label)
                         d_loss = (real_loss + fake_loss) / 2
@@ -386,7 +390,7 @@ class ModelTrainer:
                     scaler_d.step(optimizer_d)
                     scaler_d.update()
                 else:
-                    fake_clean = generator(s2_cloudy)
+                    fake_clean = generator(model_input)
                     real_loss = criterion_gan(discriminator(s2_cloudy, s2_clean), real_label)
                     fake_loss = criterion_gan(discriminator(s2_cloudy, fake_clean.detach()), fake_label)
                     d_loss = (real_loss + fake_loss) / 2
@@ -398,7 +402,7 @@ class ModelTrainer:
 
                 if use_amp and scaler_g is not None:
                     with torch.cuda.amp.autocast():
-                        fake_clean = generator(s2_cloudy)
+                        fake_clean = generator(model_input)
                         gan_loss = criterion_gan(discriminator(s2_cloudy, fake_clean), real_label)
                         l1_loss = criterion_l1(fake_clean, s2_clean)
                         g_loss = gan_loss + 100 * l1_loss
@@ -406,7 +410,7 @@ class ModelTrainer:
                     scaler_g.step(optimizer_g)
                     scaler_g.update()
                 else:
-                    fake_clean = generator(s2_cloudy)
+                    fake_clean = generator(model_input)
                     gan_loss = criterion_gan(discriminator(s2_cloudy, fake_clean), real_label)
                     l1_loss = criterion_l1(fake_clean, s2_clean)
                     g_loss = gan_loss + 100 * l1_loss
@@ -418,9 +422,11 @@ class ModelTrainer:
             val_loss = 0
             with torch.no_grad():
                 for s1, s2_cloudy, s2_clean, cloud_mask in val_loader:
+                    s1 = s1.to(self.device)
                     s2_cloudy = s2_cloudy.to(self.device)
                     s2_clean = s2_clean.to(self.device)
-                    fake_clean = generator(s2_cloudy)
+                    model_input = torch.cat([s1, s2_cloudy], dim=1)
+                    fake_clean = generator(model_input)
                     val_loss += criterion_l1(fake_clean, s2_clean).item()
 
             val_loss /= len(val_loader)
@@ -436,52 +442,104 @@ class ModelTrainer:
         early_stopping.load_best_model(generator)
         return generator
 
-    def _train_diffusion_fold(self, train_loader, val_loader, epochs, lr, patience, use_amp, n_channels):
-        """Train Diffusion model for single fold"""
-        model = DiffusionModel(in_channels=n_channels).to(self.device)
-        diffusion_trainer = DiffusionTrainer(model, self.device, num_timesteps=1000)
+    def _train_diffusion_fold(self, train_loader, val_loader, epochs, lr, patience, use_amp, n_channels, out_channels):
 
+        n_channels += 1 # 1 channel for mask
+        model = DiffusionModel(in_channels=n_channels, out_channels=out_channels).to(self.device)
         optimizer = optim.Adam(model.parameters(), lr=lr)
         early_stopping = EarlyStopping(patience=patience, verbose=True)
         scaler = torch.cuda.amp.GradScaler() if use_amp and self.device == 'cuda' else None
+
+        # Noise schedule
+        num_timesteps = 1000
+        betas = torch.linspace(1e-4, 0.02, num_timesteps).to(self.device)
+        alphas = 1.0 - betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
 
         for epoch in range(epochs):
             model.train()
             train_loss = 0
 
             for s1, s2_cloudy, s2_clean, cloud_mask in train_loader:
+                s1 = s1.to(self.device)
+                s2_cloudy = s2_cloudy.to(self.device)
                 s2_clean = s2_clean.to(self.device)
+                cloud_mask = cloud_mask.to(self.device)
+
+                batch_size = s2_clean.shape[0]
+
+                # Warunkowanie: S1 + maska chmur
+                if s1 is not None:
+                    x_cond = torch.cat([s1, cloud_mask], dim=1)
+                else:
+                    x_cond = cloud_mask
+
+                # Sample timesteps
+                t = torch.randint(0, num_timesteps, (batch_size,), device=self.device)
+
+                # Dodanie szumu do czystego obrazu
+                noise = torch.randn_like(s2_clean)
+                sqrt_alphas_cumprod_t = alphas_cumprod[t][:, None, None, None] ** 0.5
+                sqrt_one_minus_alphas_cumprod_t = (1 - alphas_cumprod[t][:, None, None, None]) ** 0.5
+                x_noisy = sqrt_alphas_cumprod_t * s2_clean + sqrt_one_minus_alphas_cumprod_t * noise
+
+                # Połączenie zaszumionego obrazu i warunku
+                x_input = torch.cat([x_noisy, x_cond], dim=1)
+
+                optimizer.zero_grad(set_to_none=True)
 
                 if use_amp and scaler is not None:
                     with torch.cuda.amp.autocast():
-                        loss = diffusion_trainer.train_step(s2_clean, optimizer)
+                        predicted_noise = model(x_input, t)
+                        loss = nn.functional.mse_loss(predicted_noise, noise)
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
                 else:
-                    loss = diffusion_trainer.train_step(s2_clean, optimizer)
+                    predicted_noise = model(x_input, t)
+                    loss = nn.functional.mse_loss(predicted_noise, noise)
+                    loss.backward()
+                    optimizer.step()
 
-                train_loss += loss
+                train_loss += loss.item()
 
             train_loss /= len(train_loader)
 
-            # Validation
+            # -----------------------
+            # Validation z rekonstrukcją
+            # -----------------------
             model.eval()
             val_loss = 0
             with torch.no_grad():
                 for s1, s2_cloudy, s2_clean, cloud_mask in val_loader:
-                    s2_cloudy = s2_cloudy.to(self.device)
+                    s1 = s1.to(self.device)
                     s2_clean = s2_clean.to(self.device)
-                    denoised = diffusion_trainer.denoise(s2_cloudy, num_inference_steps=20)
-                    val_loss += nn.functional.mse_loss(denoised, s2_clean).item()
+                    cloud_mask = cloud_mask.to(self.device)
+
+                    if s1 is not None:
+                        x_cond = torch.cat([s1, cloud_mask], dim=1)
+                    else:
+                        x_cond = cloud_mask
+
+                    # Start od losowego szumu
+                    x_noisy = torch.randn_like(s2_clean)
+
+                    # Prosty DDPM reverse process (jednostopniowy przykład)
+                    # W praktyce można użyć pełnej iteracji 1000 kroków
+                    x_input = torch.cat([x_noisy, x_cond], dim=1)
+                    predicted_noise = model(x_input, torch.zeros(batch_size, dtype=torch.long, device=self.device))
+                    x_recon = x_noisy - predicted_noise  # przybliżona rekonstrukcja
+
+                    val_loss += nn.functional.mse_loss(x_recon, s2_clean).item()
 
             val_loss /= len(val_loader)
 
-            print(f"Epoch {epoch + 1}/{epochs} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+            print(f"Epoch {epoch + 1}/{epochs} - Train: {train_loss:.6f}, Val: {val_loss:.6f}")
 
             if early_stopping(val_loss, model):
-                print(f"\nEarly stopping triggered at epoch {epoch + 1}")
                 break
 
         early_stopping.load_best_model(model)
-        return model
 
     def _train_rf_fold(self, train_loader, val_loader):
         """Train Random Forest for single fold"""

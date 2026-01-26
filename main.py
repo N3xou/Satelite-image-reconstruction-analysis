@@ -37,21 +37,22 @@ class Config:
     SEASONS = None  # None = all seasons
     S2_BANDS = list(range(1, 14))
     PATCH_SIZE = 256
-    DATA_FRACTION = 0.15 # Use 5% of data for quick training
+    DATA_FRACTION = 0.15 # Use % of data for quick training
     min_cloud_fraction = 0.1
     max_cloud_fraction = 0.7
     # Training
+    FOLDS = 3
     BATCH_SIZE = 6
-    EPOCHS = 3
+    EPOCHS = 5
     LEARNING_RATE = 0.001
-    PATIENCE = 7
+    PATIENCE = 2
     USE_AMP = True  # Automatic Mixed Precision
     NUM_WORKERS = 4
 
     # Models to train
-    #MODELS = ['SimpleCNN']
-    MODELS = ['SimpleCNN', 'UNet', 'RandomForest']  # Fast models for demo
-    # MODELS = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']  # All models
+    #MODELS = ['Diffusion']
+    #MODELS = ['SimpleCNN', 'UNet', 'RandomForest']  # Fast models for demo
+    MODELS = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']  # All models
 
     # Output
     OUTPUT_DIR = Path("./results")
@@ -510,7 +511,7 @@ def main():
             trainer = ModelTrainer(model_name, device=device)
             models, histories = trainer.train_kfold(
                 dataset=train_dataset,
-                k=4,
+                k=Config.FOLDS,
                 epochs=Config.EPOCHS,
                 batch_size=Config.BATCH_SIZE,
                 lr=Config.LEARNING_RATE,

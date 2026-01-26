@@ -258,10 +258,10 @@ class LSTMCloudRemover(nn.Module):
 class DiffusionModel(nn.Module):
     """
     Denoising Diffusion Probabilistic Model (DDPM) for cloud removal
-    Iteratively removes noise/clouds through multiple denoising steps
+    Dynamic in_channels: works with 4, 13, or 15 bands
     """
 
-    def __init__(self, in_channels=4, model_channels=64, num_res_blocks=2):
+    def __init__(self, in_channels=4, out_channels=4, model_channels=64, num_res_blocks=2):
         super(DiffusionModel, self).__init__()
 
         self.in_channels = in_channels
@@ -276,24 +276,18 @@ class DiffusionModel(nn.Module):
         )
 
         # Input projection
-        self.input_blocks = nn.ModuleList([
-            nn.Conv2d(in_channels, model_channels, 3, padding=1)
-        ])
+        self.input_blocks = nn.ModuleList([nn.Conv2d(in_channels, model_channels, 3, padding=1)])
 
-        # Downsampling path
         ch = model_channels
+        # Downsampling path
         for level in range(3):
             for _ in range(num_res_blocks):
-                self.input_blocks.append(
-                    ResBlock(ch, time_embed_dim, ch)
-                )
+                self.input_blocks.append(ResBlock(ch, time_embed_dim, ch))
             if level < 2:
-                self.input_blocks.append(
-                    nn.Conv2d(ch, ch * 2, 3, stride=2, padding=1)
-                )
+                self.input_blocks.append(nn.Conv2d(ch, ch * 2, 3, stride=2, padding=1))
                 ch *= 2
 
-        # Middle
+        # Middle blocks
         self.middle_block = nn.Sequential(
             ResBlock(ch, time_embed_dim, ch),
             ResBlock(ch, time_embed_dim, ch),
@@ -303,20 +297,16 @@ class DiffusionModel(nn.Module):
         self.output_blocks = nn.ModuleList([])
         for level in range(3):
             for _ in range(num_res_blocks):
-                self.output_blocks.append(
-                    ResBlock(ch, time_embed_dim, ch)
-                )
+                self.output_blocks.append(ResBlock(ch, time_embed_dim, ch))
             if level < 2:
-                self.output_blocks.append(
-                    nn.ConvTranspose2d(ch, ch // 2, 4, stride=2, padding=1)
-                )
+                self.output_blocks.append(nn.ConvTranspose2d(ch, ch // 2, 4, stride=2, padding=1))
                 ch //= 2
 
-        # Output
+        # Output projection - dynamic in_channels
         self.out = nn.Sequential(
             nn.GroupNorm(32, model_channels),
             nn.SiLU(),
-            nn.Conv2d(model_channels, in_channels, 3, padding=1),
+            nn.Conv2d(model_channels, out_channels, 3, padding=1),
         )
 
     def forward(self, x, timesteps):
@@ -325,11 +315,9 @@ class DiffusionModel(nn.Module):
             x: Noisy input [batch, channels, H, W]
             timesteps: Current timestep [batch]
         """
-        # Time embedding
         t_emb = self._get_timestep_embedding(timesteps, self.model_channels)
         emb = self.time_embed(t_emb)
 
-        # Process
         h = x
         hs = []
         for module in self.input_blocks:

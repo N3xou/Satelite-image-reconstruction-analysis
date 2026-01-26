@@ -70,7 +70,7 @@ def visualize_reconstructions(model_path, dataset_root, n_samples=5, device='cud
             for j in range(4):
                 axes[i, j].axis('off')
 
-    save_path = 'reconstruction_samples.png'
+    save_path = '../img/reconstruction_samples.png'
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"✓ Saved visual comparison to {save_path}")
     plt.show()
@@ -78,7 +78,7 @@ def visualize_reconstructions(model_path, dataset_root, n_samples=5, device='cud
 
 if __name__ == "__main__":
     # Point to your actual file paths
-    MODEL_PATH = "results/selfsupervised/joint_model_best.pth"
+    MODEL_PATH = "../results/selfsupervised/joint_model_best.pth"
     DATASET_ROOT = "./sen12mscr_dataset"
 
     if Path(MODEL_PATH).exists():
