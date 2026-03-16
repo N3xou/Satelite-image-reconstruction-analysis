@@ -52,7 +52,7 @@ class Config:
     # Models to train
     #MODELS = ['Diffusion']
     #MODELS = ['SimpleCNN', 'UNet', 'RandomForest']  # Fast models for demo
-    MODELS = ['SimpleCNN', 'UNet', 'GAN', 'LSTM', 'Diffusion']  # All models
+    MODELS = ['SimpleCNN', 'UNet', 'GAN', 'RandomForest', 'Diffusion']  # All models
 
     # Output
     OUTPUT_DIR = Path("./results")
