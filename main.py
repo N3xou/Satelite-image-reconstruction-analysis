@@ -37,9 +37,9 @@ class Config:
     SEASONS = None  # None = all seasons
     S2_BANDS = list(range(1, 14))
     PATCH_SIZE = 256
-    DATA_FRACTION = 0.15 # Use % of data for quick training
+    DATA_FRACTION = 0.05 # Use % of data for quick training
     min_cloud_fraction = 0.1
-    max_cloud_fraction = 0.7
+    max_cloud_fraction = 0.9
     # Training
     FOLDS = 3
     BATCH_SIZE = 6
@@ -50,12 +50,12 @@ class Config:
     NUM_WORKERS = 4
 
     # Models to train
-    #MODELS = ['Diffusion']
+    MODELS = ['SimpleCNN']
     #MODELS = ['SimpleCNN', 'UNet', 'RandomForest']  # Fast models for demo
-    MODELS = ['SimpleCNN', 'UNet', 'GAN', 'RandomForest', 'Diffusion']  # All models
+    #MODELS = ['SimpleCNN', 'UNet', 'GAN', 'RandomForest', 'Diffusion']  # All models
 
     # Output
-    OUTPUT_DIR = Path("./results")
+    OUTPUT_DIR = Path("./resultsTest")
     SAVE_MODELS = True
 
 # ==================== 2. DATA EXPLORATION & INSIGHTS ====================
@@ -416,6 +416,7 @@ def main():
             data_fraction=Config.DATA_FRACTION,
             min_cloud_fraction=Config.min_cloud_fraction,
             max_cloud_fraction=Config.max_cloud_fraction,
+            cloud_mask_mode="gt_diff",
             random_seed=42
         )
 

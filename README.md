@@ -124,6 +124,15 @@ def compute_cloud_mask(s1, s2_cloudy) -> np.ndarray
 3. Normalize both locally
 4. Cloud likelihood: `opt × (1 - sar)` (bright optical + weak SAR = cloud)
 
+**Available modes for cloud masking**
+
+cloud_mask_mode | Needs clean image? | Best for
+
+1. "combined"✅ | yes | Training (default, recommended)
+2. "gt_diff"✅ | yes | Training / ablations
+3. "gt_threshold"✅ | yes | When hard binary mask is needed
+4. "spectral"❌ | no | Inference (no ground truth available)
+5. "sar_optical"❌ | no | Legacy / backward compatibility
 ## 🧠 Models
 
 ### Model Architectures (`Models.py`)

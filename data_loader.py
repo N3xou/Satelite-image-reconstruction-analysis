@@ -100,14 +100,11 @@ class SEN12MSCRExtractor:
 
             print(f"\nExtracting {tar_path.name}...")
 
-            # Extract season name from filename
-            # Format: ROIsXXXX_season_sensor.tar
             parts = tar_path.stem.split('_')
             if len(parts) >= 2:
-                season = parts[1]  # spring, summer, fall, winter
+                season = parts[1]
                 extracted_seasons.add(season)
 
-            # Extract to output directory
             with tarfile.open(tar_path, 'r') as tar:
                 tar.extractall(self.output_dir)
                 print(f"  ✓ Extracted to {self.output_dir}")
@@ -138,14 +135,12 @@ class SEN12MSCRExtractor:
                 print(f"\n✓ Found season: {season_name}")
                 found_seasons.append(season_name)
 
-                # Count scenes (directories like s1_XXX, s2_XXX)
                 s1_scenes = list(season_path.glob('s1_*'))
                 s2_scenes = list(season_path.glob('s2_*'))
 
                 print(f"  S1 scenes: {len(s1_scenes)}")
                 print(f"  S2 scenes: {len(s2_scenes)}")
 
-                # Count patches in first scene
                 if s1_scenes:
                     patches = list(s1_scenes[0].glob('*.tif'))
                     print(f"  Patches per scene (sample): {len(patches)}")
@@ -160,6 +155,247 @@ class SEN12MSCRExtractor:
             print("    ROIs2017_winter/")
 
         return found_seasons
+
+
+# ==================== CLOUD MASKING ====================
+
+class CloudMaskComputer:
+    """
+    Multi-method cloud mask computation for SEN12MS-CR.
+
+    Modes
+    -----
+    "gt_diff"      : Ground-truth difference mask.
+                     Uses |cloudy - clean| per pixel, averaged across bands.
+                     Most accurate — only possible because we have paired data.
+
+    "gt_threshold" : Hard binary mask from ground-truth difference.
+                     Pixels where mean absolute diff > `gt_threshold` are
+                     flagged as cloudy.  Returns float in {0, 1}.
+
+    "spectral"     : Physics-based spectral mask.
+                     Combines brightness, Blue/NIR haze ratio and SWIR
+                     cirrus band (B10 at index 10 when all 13 bands present).
+                     Doesn't need the clean image; useful at inference time.
+
+    "sar_optical"  : Original SAR vs. optical disagreement heuristic
+                     (kept for backward compatibility / ablation studies).
+
+    "combined"     : Weighted blend of gt_diff + spectral.
+                     Best of both worlds for training: supervised signal
+                     guides the mask while spectral features keep it
+                     physically interpretable.
+
+    Parameters
+    ----------
+    mode          : one of the strings above (default: "combined")
+    gt_diff_weight: weight of gt_diff component in "combined" mode (0-1)
+    gt_threshold  : threshold for "gt_threshold" mode (default: 0.10)
+    """
+
+    MODES = {"gt_diff", "gt_threshold", "spectral", "sar_optical", "combined"}
+
+    def __init__(
+        self,
+        mode: str = "combined",
+        gt_diff_weight: float = 0.6,
+        gt_threshold: float = 0.10,
+    ):
+        if mode not in self.MODES:
+            raise ValueError(f"Unknown cloud_mask_mode '{mode}'. Choose from {self.MODES}")
+        self.mode = mode
+        self.gt_diff_weight = gt_diff_weight
+        self.gt_threshold = gt_threshold
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    def compute(
+        self,
+        s2_cloudy: np.ndarray,
+        s2_clean: np.ndarray,
+        s1: np.ndarray,
+        s2_bands: list,
+    ) -> np.ndarray:
+        """
+        Compute cloud mask.
+
+        Parameters
+        ----------
+        s2_cloudy : float32 array [C, H, W], normalised to [0,1]
+        s2_clean  : float32 array [C, H, W], normalised to [0,1]
+        s1        : float32 array [2, H, W], normalised to [0,1]
+        s2_bands  : list of 1-based Sentinel-2 band indices loaded
+
+        Returns
+        -------
+        mask : float32 array [1, H, W] in [0, 1]
+        """
+        if self.mode == "gt_diff":
+            return self._gt_diff(s2_cloudy, s2_clean)
+        elif self.mode == "gt_threshold":
+            return self._gt_threshold(s2_cloudy, s2_clean)
+        elif self.mode == "spectral":
+            return self._spectral(s2_cloudy, s2_bands)
+        elif self.mode == "sar_optical":
+            return self._sar_optical(s1, s2_cloudy)
+        elif self.mode == "combined":
+            return self._combined(s2_cloudy, s2_clean, s1, s2_bands)
+
+    # ------------------------------------------------------------------
+    # Individual methods
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _gt_diff(s2_cloudy: np.ndarray, s2_clean: np.ndarray) -> np.ndarray:
+        """
+        Ground-truth difference mask.
+
+        Cloud pixels are bright in s2_cloudy but not in s2_clean.
+        We take the mean absolute difference across spectral bands, then
+        clip and normalise to [0, 1].
+
+        This is the most informative signal available during training:
+        it tells the model *exactly* where and how strongly clouds affect
+        each pixel, including semi-transparent / thin clouds that spectral
+        methods miss.
+        """
+        diff = np.abs(s2_cloudy.astype(np.float32) - s2_clean.astype(np.float32))
+        # Mean over spectral axis -> [H, W]
+        mask = diff.mean(axis=0)
+        # Robust normalisation: clip at 99th percentile to suppress outliers
+        p99 = np.percentile(mask, 99)
+        if p99 > 1e-6:
+            mask = np.clip(mask / p99, 0.0, 1.0)
+        return mask[None, :, :].astype(np.float32)   # [1, H, W]
+
+    @staticmethod
+    def _gt_threshold(s2_cloudy: np.ndarray, s2_clean: np.ndarray,
+                      threshold: float = 0.10) -> np.ndarray:
+        """
+        Hard binary mask derived from ground-truth difference.
+
+        Pixels with mean |cloudy - clean| > threshold are set to 1.
+        A small morphological dilation (3×3 max-pool) catches cloud
+        halos / shadow edges.
+        """
+        diff = np.abs(s2_cloudy.astype(np.float32) - s2_clean.astype(np.float32))
+        mask = (diff.mean(axis=0) > threshold).astype(np.float32)
+
+        # Simple 3×3 max-pool dilation (pure numpy, no scipy dependency)
+        from numpy.lib.stride_tricks import sliding_window_view
+        pad = np.pad(mask, 1, mode='edge')
+        windows = sliding_window_view(pad, (3, 3))
+        mask = windows.max(axis=(-2, -1))
+
+        return mask[None, :, :].astype(np.float32)
+
+    @staticmethod
+    def _spectral(s2_cloudy: np.ndarray, s2_bands: list) -> np.ndarray:
+        """
+        Physics-based spectral cloud mask.
+
+        Uses three complementary signals:
+        1. Visible brightness  – clouds are bright across all bands.
+        2. Blue / NIR ratio    – haze and thin clouds raise blue relative
+                                  to NIR (where vegetation absorbs).
+        3. SWIR cirrus band    – B10 (1375 nm) specifically targets
+                                  cirrus clouds.  Used when available.
+
+        Each component is individually normalised then blended with
+        empirically chosen weights.
+        """
+        band_idx = {b: i for i, b in enumerate(s2_bands)}
+
+        def _norm(arr):
+            lo, hi = arr.min(), arr.max()
+            return (arr - lo) / (hi - lo + 1e-8)
+
+        # 1. Mean visible brightness (B02, B03, B04 = bands 2,3,4)
+        vis_indices = [band_idx[b] for b in [2, 3, 4] if b in band_idx]
+        if vis_indices:
+            brightness = s2_cloudy[vis_indices].mean(axis=0)
+        else:
+            brightness = s2_cloudy.mean(axis=0)
+
+        brightness_norm = _norm(brightness)
+
+        # 2. Blue / NIR haze ratio
+        b02_available = 2 in band_idx
+        b08_available = 8 in band_idx
+
+        if b02_available and b08_available:
+            blue = s2_cloudy[band_idx[2]]
+            nir  = s2_cloudy[band_idx[8]]
+            # High ratio → haze / thin clouds; cap at 2 to avoid div-by-zero
+            haze_ratio = np.clip(blue / (nir + 1e-6), 0.0, 2.0) / 2.0
+            haze_norm = _norm(haze_ratio)
+        else:
+            haze_norm = np.zeros_like(brightness_norm)
+
+        # 3. Cirrus band (B10, index 10 in 1-based numbering)
+        if 10 in band_idx:
+            cirrus = s2_cloudy[band_idx[10]]
+            cirrus_norm = _norm(cirrus)
+            weights = (0.45, 0.30, 0.25)
+        else:
+            cirrus_norm = np.zeros_like(brightness_norm)
+            weights = (0.55, 0.45, 0.0)
+
+        mask = (weights[0] * brightness_norm
+                + weights[1] * haze_norm
+                + weights[2] * cirrus_norm)
+
+        return mask[None, :, :].astype(np.float32)
+
+    @staticmethod
+    def _sar_optical(s1: np.ndarray, s2_cloudy: np.ndarray) -> np.ndarray:
+        """
+        Original SAR–optical disagreement heuristic (backward-compatible).
+
+        Clouds: bright in optical (high reflectance) but attenuate SAR
+        backscatter, causing a disagreement.
+        """
+        opt = s2_cloudy.mean(axis=0)
+        sar = np.mean(np.abs(s1), axis=0)
+
+        opt = (opt - opt.min()) / (opt.max() - opt.min() + 1e-6)
+        sar = (sar - sar.min()) / (sar.max() - sar.min() + 1e-6)
+
+        mask = opt * (1.0 - sar)
+        return mask[None, :, :].astype(np.float32)
+
+    def _combined(
+        self,
+        s2_cloudy: np.ndarray,
+        s2_clean: np.ndarray,
+        s1: np.ndarray,
+        s2_bands: list,
+    ) -> np.ndarray:
+        """
+        Weighted blend: gt_diff + spectral.
+
+        gt_diff provides an accurate supervised signal for training.
+        spectral adds physically meaningful structure (spatial texture,
+        cirrus vs. thick cloud differentiation) that pure pixel-diff
+        can miss around cloud edges.
+
+        gt_diff_weight controls the blend (default 0.6 / 0.4).
+        """
+        gt   = self._gt_diff(s2_cloudy, s2_clean)
+        spec = self._spectral(s2_cloudy, s2_bands)
+
+        w_gt   = self.gt_diff_weight
+        w_spec = 1.0 - w_gt
+
+        combined = w_gt * gt + w_spec * spec
+        # Re-normalise to [0, 1]
+        p99 = np.percentile(combined, 99)
+        if p99 > 1e-6:
+            combined = np.clip(combined / p99, 0.0, 1.0)
+
+        return combined.astype(np.float32)
 
 
 # ==================== PYTORCH DATASET ====================
@@ -181,10 +417,20 @@ class SEN12MSCRDataset(Dataset):
     Input:
         S1 SAR (VV, VH)            -> (2, H, W)
         S2 cloudy (13 bands)       -> (13, H, W)
-        Soft cloud mask            -> (1, H, W)
+        Cloud mask                 -> (1, H, W)
 
     Target:
         S2 clean (13 bands)        -> (13, H, W)
+
+    Cloud mask modes
+    ----------------
+    "combined"     : (default) Supervised gt_diff + spectral blend.
+                      Most informative for training.
+    "gt_diff"      : Soft mask from |cloudy - clean|.  Exact but soft.
+    "gt_threshold" : Hard binary mask from |cloudy - clean|.
+    "spectral"     : Physics-based (brightness + haze + cirrus).
+                      Usable at inference time without ground truth.
+    "sar_optical"  : Legacy SAR vs optical disagreement.
     """
 
     def __init__(
@@ -197,16 +443,21 @@ class SEN12MSCRDataset(Dataset):
         min_cloud_fraction=0.05,
         max_cloud_fraction=0.9,
         random_seed=42,
-        cloud_mask_mode: str = "simple",
-        deep_model_kwargs: dict | None = None
+        cloud_mask_mode: str = "combined",
+        gt_diff_weight: float = 0.6,
+        gt_threshold: float = 0.10,
     ):
         self.root_dir = Path(root_dir)
         self.patch_size = patch_size
         self.min_cloud_fraction = min_cloud_fraction
         self.max_cloud_fraction = max_cloud_fraction
         self.rng = random.Random(random_seed)
-        self.cloud_mask_mode = cloud_mask_mode
-        self.deep_model_kwargs = deep_model_kwargs or {}
+
+        self.mask_computer = CloudMaskComputer(
+            mode=cloud_mask_mode,
+            gt_diff_weight=gt_diff_weight,
+            gt_threshold=gt_threshold,
+        )
 
         # Seasons
         if seasons is None:
@@ -276,7 +527,8 @@ class SEN12MSCRDataset(Dataset):
         print(
             f"[SEN12MS-CR] Loaded {len(self.samples)} samples "
             f"from {len(selected_scenes)} scenes "
-            f"({data_fraction * 100:.1f}%)"
+            f"({data_fraction * 100:.1f}%) | "
+            f"cloud_mask_mode='{cloud_mask_mode}'"
         )
 
     def __len__(self):
@@ -292,7 +544,6 @@ class SEN12MSCRDataset(Dataset):
 
     @staticmethod
     def normalize_s1(x):
-        # SAR is in dB, typical SEN12MS-CR range
         x = np.clip(x, -25.0, 0.0)
         return (x + 25.0) / 25.0
 
@@ -312,26 +563,20 @@ class SEN12MSCRDataset(Dataset):
         return [a[:, y:y + ps, x:x + ps] for a in arrays]
 
     # --------------------------------------------------
-    # Soft cloud mask (SAR–optical disagreement)
+    # Legacy static method (kept for backward compatibility)
     # --------------------------------------------------
     @staticmethod
     def compute_cloud_mask(s1, s2_cloudy):
         """
-        Soft cloud likelihood mask in [0,1]
+        Backward-compatible static wrapper.
+        Uses original SAR–optical heuristic.
+        For the improved supervised / spectral masks use CloudMaskComputer.
         """
-        # Optical brightness
         opt = s2_cloudy.mean(axis=0)
-
-        # SAR energy (VV + VH)
         sar = np.mean(np.abs(s1), axis=0)
-
-        # Normalize locally
         opt = (opt - opt.min()) / (opt.max() - opt.min() + 1e-6)
         sar = (sar - sar.min()) / (sar.max() - sar.min() + 1e-6)
-
-        # Clouds: bright in optical, weak in SAR
         cloud_likelihood = opt * (1.0 - sar)
-
         return cloud_likelihood[None, :, :].astype(np.float32)
 
     # --------------------------------------------------
@@ -357,8 +602,13 @@ class SEN12MSCRDataset(Dataset):
         s2_cloudy = self.normalize_s2(s2_cloudy)
         s2_clean = self.normalize_s2(s2_clean)
 
-
-        cloud_mask = self.compute_cloud_mask(s1, s2_cloudy)
+        # Compute cloud mask (uses clean image when available)
+        cloud_mask = self.mask_computer.compute(
+            s2_cloudy=s2_cloudy,
+            s2_clean=s2_clean,
+            s1=s1,
+            s2_bands=self.s2_bands,
+        )
 
         # Random crop
         s1, s2_cloudy, s2_clean, cloud_mask = self.random_crop(
@@ -372,8 +622,8 @@ class SEN12MSCRDataset(Dataset):
 
         return (
             torch.from_numpy(s1),          # (2, H, W)
-            torch.from_numpy(s2_cloudy),   # (13, H, W)
-            torch.from_numpy(s2_clean),    # (13, H, W)
+            torch.from_numpy(s2_cloudy),   # (C, H, W)
+            torch.from_numpy(s2_clean),    # (C, H, W)
             torch.from_numpy(cloud_mask)   # (1, H, W)
         )
 
@@ -385,7 +635,6 @@ class SEN12MSCRSplitter:
         self.base_dir = Path(base_dir)
         self.output_dir = Path(output_dir)
 
-        # Create output structure
         self.train_dir = self.output_dir / 'train'
         self.val_dir = self.output_dir / 'val'
         self.small_dir = self.output_dir / 'small'
@@ -395,13 +644,6 @@ class SEN12MSCRSplitter:
             (dir_path / 'cloudy').mkdir(parents=True, exist_ok=True)
 
     def collect_all_samples(self, seasons=None, s2_bands=None):
-        """
-        Collect all valid sample pairs from the dataset
-
-        Args:
-            seasons: List of seasons to include (None = all)
-            s2_bands: List of S2 band indices to extract (None = all 13)
-        """
         if seasons is None:
             seasons = [
                 "ROIs1158_spring",
@@ -411,7 +653,7 @@ class SEN12MSCRSplitter:
             ]
 
         if s2_bands is None:
-            s2_bands = list(range(1, 14))  # All 13 bands
+            s2_bands = list(range(1, 14))
 
         self.s2_bands = s2_bands
 
@@ -462,41 +704,28 @@ class SEN12MSCRSplitter:
 
     def split_and_save(self, samples, train_ratio=0.8, small_ratio=0.05,
                        random_state=42):
-        """
-        Split samples into train/val/small and save as numpy arrays
-
-        Args:
-            samples: List of sample dictionaries
-            train_ratio: Ratio for training set (0.8 = 80%)
-            small_ratio: Ratio for small dataset (0.05 = 5% of total)
-            random_state: Random seed for reproducibility
-        """
         print("\n" + "=" * 70)
         print("SPLITTING AND SAVING DATASET")
         print("=" * 70)
 
-        # Group by scene to avoid data leakage
         scenes = defaultdict(list)
         for s in samples:
             scenes[(s["season"], s["scene_id"])].append(s)
 
         scene_keys = list(scenes.keys())
 
-        # Split: 80% train, 20% val
         train_keys, val_keys = train_test_split(
             scene_keys,
             test_size=(1 - train_ratio),
             random_state=random_state
         )
 
-        # Create small dataset (5% of all data)
         small_keys, _ = train_test_split(
             scene_keys,
             test_size=(1 - small_ratio),
             random_state=random_state
         )
 
-        # Reconstruct sample lists
         train_samples = [s for k in train_keys for s in scenes[k]]
         val_samples = [s for k in val_keys for s in scenes[k]]
         small_samples = [s for k in small_keys for s in scenes[k]]
@@ -506,7 +735,6 @@ class SEN12MSCRSplitter:
         print(f"  Validation: {len(val_samples)} samples ({len(val_samples) / len(samples) * 100:.1f}%)")
         print(f"  Small:      {len(small_samples)} samples ({len(small_samples) / len(samples) * 100:.1f}%)")
 
-        # Save each split
         self._save_split(train_samples, self.train_dir, "Training")
         self._save_split(val_samples, self.val_dir, "Validation")
         self._save_split(small_samples, self.small_dir, "Small")
@@ -514,21 +742,8 @@ class SEN12MSCRSplitter:
         print("\n" + "=" * 70)
         print("DATASET PROCESSING COMPLETE!")
         print("=" * 70)
-        print(f"\nProcessed data saved to: {self.output_dir}")
-        print("\nDirectory structure:")
-        print("  processed_data/")
-        print("    ├── train/")
-        print("    │   ├── clean/")
-        print("    │   └── cloudy/")
-        print("    ├── val/")
-        print("    │   ├── clean/")
-        print("    │   └── cloudy/")
-        print("    └── small/")
-        print("        ├── clean/")
-        print("        └── cloudy/")
 
     def _save_split(self, samples, output_dir, split_name):
-        """Save a single split (train/val/small) as numpy arrays"""
         print(f"\nSaving {split_name} set...")
 
         clean_dir = output_dir / 'clean'
@@ -536,22 +751,18 @@ class SEN12MSCRSplitter:
 
         for idx, sample in enumerate(tqdm(samples, desc=f"Processing {split_name}")):
             try:
-                # Load S2 cloudy
                 with rasterio.open(sample['s2_cloudy']) as src:
                     s2_cloudy = src.read(self.s2_bands)
 
-                # Load S2 clean
                 with rasterio.open(sample['s2']) as src:
                     s2_clean = src.read(self.s2_bands)
 
-                # Normalize to [0, 1]
                 s2_cloudy = s2_cloudy.astype(np.float32) / 10000.0
                 s2_clean = s2_clean.astype(np.float32) / 10000.0
 
                 s2_cloudy = np.clip(s2_cloudy, 0, 1)
                 s2_clean = np.clip(s2_clean, 0, 1)
 
-                # Save as numpy arrays
                 filename = f"{sample['season']}_{sample['scene_id']}_{idx:05d}.npy"
                 np.save(clean_dir / filename, s2_clean)
                 np.save(cloudy_dir / filename, s2_cloudy)
@@ -584,8 +795,6 @@ def visualize_sen12mscr_samples(dataset, n_samples=3, save_path='sen12mscr_sampl
             s2 = data[1]
             s1 = None
 
-        # Take RGB bands (B04=Red, B03=Green, B02=Blue = bands 4,3,2 = indices 3,2,1)
-        # Assuming full 13 bands, RGB are at indices [3,2,1]
         if s2_cloudy.shape[0] >= 13:
             cloudy_rgb = s2_cloudy[[3, 2, 1]].permute(1, 2, 0).numpy()
             clean_rgb = s2[[3, 2, 1]].permute(1, 2, 0).numpy()
@@ -631,13 +840,11 @@ def split_interface():
 ╚══════════════════════════════════════════════════════════════════════════╝
     """)
 
-    # Initialize splitter
     splitter = SEN12MSCRSplitter(
         base_dir='./sen12mscr_dataset',
         output_dir='./processed_data'
     )
 
-    # Ask user for band selection
     print("\nSelect bands to process:")
     print("1. RGB + NIR (bands 2,3,4,8 - recommended, 4 bands)")
     print("2. All 13 bands (complete Sentinel-2)")
@@ -653,10 +860,9 @@ def split_interface():
         bands = [int(b.strip()) for b in bands_input.split(',')]
         print(f"Using bands: {bands}")
     else:
-        bands = [2, 3, 4, 8]  # Default: Blue, Green, Red, NIR
+        bands = [2, 3, 4, 8]
         print("Using RGB + NIR (4 bands)")
 
-    # Ask for seasons
     print("\nSelect seasons to process:")
     print("1. All seasons (spring, summer, fall, winter)")
     print("2. Specific seasons")
@@ -674,23 +880,18 @@ def split_interface():
         }
         seasons = [season_map[s.strip().lower()] for s in seasons_input.split(',')]
     else:
-        seasons = None  # All seasons
+        seasons = None
 
-    # Collect samples
     samples = splitter.collect_all_samples(seasons=seasons, s2_bands=bands)
 
     if len(samples) == 0:
         print("\n✗ No samples found! Check your dataset structure.")
         return
 
-    # Confirm before processing
     print(f"\nAbout to process {len(samples)} samples.")
-    print("This will create numpy arrays for faster loading.")
-
     confirm = input("\nProceed? (y/n): ").strip().lower()
 
     if confirm == 'y':
-        # Split and save
         splitter.split_and_save(
             samples,
             train_ratio=0.8,
@@ -699,10 +900,6 @@ def split_interface():
         )
 
         print("\n✓ Dataset processing complete!")
-        print("\nNext steps:")
-        print("1. Run: python main_simple.py")
-        print("2. The script will automatically load from processed_data/")
-        print("3. No need to run this splitter again!")
     else:
         print("Cancelled.")
 
@@ -724,16 +921,10 @@ if __name__ == '__main__':
     print("6. Split interface")
     print("7. Exit")
 
-    choice = input("\nEnter choice (1-6): ").strip()
+    choice = input("\nEnter choice (1-7): ").strip()
 
     if choice == '1':
         print("\nEnter paths to your tar files:")
-        print("(Press Enter after each path, empty line when done)")
-        print("\nExpected files (example):")
-        print("  ROIs2017_winter_s1.tar")
-        print("  ROIs2017_winter_s2.tar")
-        print("  ROIs2017_winter_s2_cloudy.tar")
-
         tar_files = []
         while True:
             path = input(f"  Tar file {len(tar_files) + 1}: ").strip()
@@ -758,101 +949,54 @@ if __name__ == '__main__':
 
         if found:
             print(f"\n✓ Dataset is ready to use!")
-            print(f"  Found {len(found)} season(s)")
 
     elif choice == '3':
         print("\nTesting dataset loading...")
-        print("Which seasons do you have? (comma-separated, or 'all')")
-        print("Available: winter, spring, summer, fall")
-
-        seasons_input = input("Seasons: ").strip()
-        if seasons_input.lower() == 'all':
-            seasons = None
-        else:
-            seasons = [s.strip() for s in seasons_input.split(',')]
+        seasons_input = input("Seasons (comma-separated or 'all'): ").strip()
+        seasons = None if seasons_input.lower() == 'all' else [s.strip() for s in seasons_input.split(',')]
 
         try:
-            # Test with RGB + NIR
-            print("\nLoading with RGB + NIR bands [2,3,4,8]...")
+            print("\nLoading with combined cloud mask (gt_diff + spectral)...")
             train_dataset = SEN12MSCRDataset(
                 './sen12mscr_dataset',
                 seasons=seasons,
-                s2_bands=[2, 3, 4, 8],  # Blue, Green, Red, NIR
-                split='train'
-            )
-
-            val_dataset = SEN12MSCRDataset(
-                './sen12mscr_dataset',
-                seasons=seasons,
                 s2_bands=[2, 3, 4, 8],
-                split='val'
+                cloud_mask_mode='combined',
             )
+            print(f"\n✓ Successfully loaded {len(train_dataset)} samples")
 
-            print(f"\n✓ Successfully loaded!")
-            print(f"  Training: {len(train_dataset)} samples")
-            print(f"  Validation: {len(val_dataset)} samples")
-
-            # Test loading one sample
-            print("\nTesting sample loading...")
-            s2_cloudy, s2_clean = train_dataset[0]
+            s1, s2_cloudy, s2_clean, cloud_mask = train_dataset[0]
+            print(f"✓ S1 shape:        {s1.shape}")
             print(f"✓ S2 cloudy shape: {s2_cloudy.shape}")
-            print(f"✓ S2 clean shape: {s2_clean.shape}")
-            print(f"✓ Value range: [{s2_cloudy.min():.3f}, {s2_cloudy.max():.3f}]")
-
-            # Show sample info
-            info = train_dataset.get_sample_info(0)
-            print(f"\n✓ Sample info:")
-            print(f"  Season: {info['season']}")
-            print(f"  Scene ID: {info['scene_id']}")
-
-            print("\n✓ Dataset is ready to use!")
+            print(f"✓ S2 clean shape:  {s2_clean.shape}")
+            print(f"✓ Cloud mask shape:{cloud_mask.shape}")
+            print(f"✓ Mask range:      [{cloud_mask.min():.3f}, {cloud_mask.max():.3f}]")
+            print(f"✓ Mean cloud frac: {cloud_mask.mean():.2%}")
 
         except Exception as e:
             print(f"\n✗ Error: {e}")
             import traceback
-
             traceback.print_exc()
 
     elif choice == '4':
-        print("\nVisualizing samples...")
         seasons_input = input("Seasons (comma-separated or 'all'): ").strip()
-        if seasons_input.lower() == 'all':
-            seasons = None
-        else:
-            seasons = [s.strip() for s in seasons_input.split(',')]
+        seasons = None if seasons_input.lower() == 'all' else [s.strip() for s in seasons_input.split(',')]
 
         try:
             dataset = SEN12MSCRDataset(
                 './sen12mscr_dataset',
                 seasons=seasons,
-                s2_bands=list(range(1, 14)),  # All bands for best RGB
-                split='train'
+                s2_bands=list(range(1, 14)),
             )
             visualize_sen12mscr_samples(dataset, n_samples=3)
         except Exception as e:
             print(f"✗ Error: {e}")
 
     elif choice == '5':
-        print("\nDataset Statistics")
-        print("=" * 70)
-
         extractor = SEN12MSCRExtractor('./sen12mscr_dataset')
-        found_seasons = extractor.verify_structure()
+        extractor.verify_structure()
 
-        if found_seasons:
-            print(f"\nTotal seasons found: {len(found_seasons)}")
-            print("\nTo get full statistics, load the dataset with option 3")
-    elif choice =='6':
+    elif choice == '6':
         split_interface()
     else:
         print("Exiting...")
-
-    print("""
-╔══════════════════════════════════════════════════════════════════════════╗
-║  Next Steps:                                                             ║
-║  1. Extract tar files (option 1)                                         ║
-║  2. Verify structure (option 2)                                          ║
-║  3. Test loading (option 3)                                              ║
-║  4. Train models: python satellite_cloud_removal.py                      ║
-╚══════════════════════════════════════════════════════════════════════════╝
-    """)

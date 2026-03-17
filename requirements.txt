@@ -1,0 +1,21 @@
+# ── Core scientific stack ────────────────────────────────────────────────────
+numpy>=1.24
+scipy>=1.11               # speckle filtering in Visualization.py
+pandas>=2.0
+
+# ── Machine / deep learning ──────────────────────────────────────────────────
+torch>=2.1                # AMP, cudnn benchmark, tf32 flags used in training
+scikit-learn>=1.3         # RandomForestRegressor, KFold, train_test_split
+
+# ── Remote sensing / raster I/O ──────────────────────────────────────────────
+rasterio>=1.3             # reading .tif Sentinel files (data_loader.py, inference.py)
+
+# ── Visualisation ────────────────────────────────────────────────────────────
+matplotlib>=3.7
+
+# ── Progress bars ────────────────────────────────────────────────────────────
+tqdm>=4.66
+
+# ── Optional: GPU-accelerated data loading (PyTorch recommends this) ─────────
+# Uncomment if you use pin_memory + multi-worker DataLoader on Linux
+# nvidia-dali-cuda120
