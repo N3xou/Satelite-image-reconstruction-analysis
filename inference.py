@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 import torch
 import rasterio
-from Models import UNet, SimpleCNN, Generator
+from Models import UNet, SimpleCNN, Generator, DSen2CR
 
 
 class SingleImageInference:
@@ -47,6 +47,8 @@ class SingleImageInference:
             model = SimpleCNN(in_channels=n_channels, out_channels=n_channels)
         elif self.model_type == 'GAN':
             model = Generator(in_channels=n_channels, out_channels=n_channels)
+        elif self.model_type == "DSen2CR":
+            model = DSen2CR(in_channels=n_in, out_channels=n_out)
         else:
             raise ValueError(f"Unknown model type: {self.model_type}")
 

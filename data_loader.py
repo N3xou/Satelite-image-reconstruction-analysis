@@ -252,23 +252,30 @@ class CloudMaskComputer:
         """
         Ground-truth difference mask.
 
-        Cloud pixels are bright in s2_cloudy but not in s2_clean.
-        We take the mean absolute difference across spectral bands, then
-        clip and normalise to [0, 1].
+        Takes the mean absolute difference across bands and maps it to [0,1]
+        using a fixed physical scale rather than per-image normalisation.
 
-        This is the most informative signal available during training:
-        it tells the model *exactly* where and how strongly clouds affect
-        each pixel, including semi-transparent / thin clouds that spectral
-        methods miss.
+        WHY FIXED SCALE (not per-image p99):
+        Per-image normalisation was the root cause of wrong coverage readings.
+        On a nearly fully-clouded image p99 is large, so all values get
+        divided by a large number → mean collapses to ~0.45 even when 80%
+        of pixels are cloud.  On a nearly-clear image p99 is tiny (~noise),
+        so the whole range gets stretched to fill [0,1] → mean inflates to
+        ~0.42 even when only 5% of pixels are cloud.
+
+        Fixed scale: images are normalised to [0,1] (÷10000), so the maximum
+        possible mean absolute diff per pixel is 1.0.  A diff of 0.15 (=1500
+        reflectance units) is a solid cloud signal; anything above 0.3 is
+        almost certainly cloud.  We scale by 0.3 so that value maps to 1.0,
+        giving a physically-grounded soft mask where:
+            0.0  = no difference (clear)
+            0.5  = diff ~0.15  (thin cloud / haze)
+            1.0  = diff ≥0.30  (thick cloud)
         """
         diff = np.abs(s2_cloudy.astype(np.float32) - s2_clean.astype(np.float32))
-        # Mean over spectral axis -> [H, W]
-        mask = diff.mean(axis=0)
-        # Robust normalisation: clip at 99th percentile to suppress outliers
-        p99 = np.percentile(mask, 99)
-        if p99 > 1e-6:
-            mask = np.clip(mask / p99, 0.0, 1.0)
-        return mask[None, :, :].astype(np.float32)   # [1, H, W]
+        mask = diff.mean(axis=0)                     # [H, W], values in [0, 1]
+        mask = np.clip(mask / 0.30, 0.0, 1.0)       # fixed physical scale
+        return mask[None, :, :].astype(np.float32)  # [1, H, W]
 
     @staticmethod
     def _gt_threshold(s2_cloudy: np.ndarray, s2_clean: np.ndarray,
@@ -376,26 +383,22 @@ class CloudMaskComputer:
         """
         Weighted blend: gt_diff + spectral.
 
-        gt_diff provides an accurate supervised signal for training.
-        spectral adds physically meaningful structure (spatial texture,
-        cirrus vs. thick cloud differentiation) that pure pixel-diff
-        can miss around cloud edges.
+        gt_diff provides an accurate supervised signal using a fixed physical
+        scale (see _gt_diff).  spectral adds texture (cirrus, haze).
 
-        gt_diff_weight controls the blend (default 0.6 / 0.4).
+        The second p99 re-normalisation that was here previously was removed:
+        it was compounding the per-image bias already present in gt_diff,
+        causing the combined mask mean to be ~0.42–0.45 regardless of the
+        actual cloud fraction in the image.
+
+        Both components are already in [0,1] on compatible scales, so a
+        weighted sum followed by a simple clip is sufficient.
         """
-        gt   = self._gt_diff(s2_cloudy, s2_clean)
-        spec = self._spectral(s2_cloudy, s2_bands)
+        gt   = self._gt_diff(s2_cloudy, s2_clean)         # [0,1], fixed scale
+        spec = self._spectral(s2_cloudy, s2_bands)         # [0,1], per-image norm
 
-        w_gt   = self.gt_diff_weight
-        w_spec = 1.0 - w_gt
-
-        combined = w_gt * gt + w_spec * spec
-        # Re-normalise to [0, 1]
-        p99 = np.percentile(combined, 99)
-        if p99 > 1e-6:
-            combined = np.clip(combined / p99, 0.0, 1.0)
-
-        return combined.astype(np.float32)
+        combined = self.gt_diff_weight * gt + (1.0 - self.gt_diff_weight) * spec
+        return np.clip(combined, 0.0, 1.0).astype(np.float32)
 
 
 # ==================== PYTORCH DATASET ====================
@@ -616,7 +619,10 @@ class SEN12MSCRDataset(Dataset):
         )
 
         # Cloud fraction filtering
-        cf = cloud_mask.mean()
+        # Use a threshold to estimate binary coverage from the soft mask,
+        # rather than taking the raw mean (which underestimates heavily-clouded
+        # images and overestimates nearly-clear ones when the mask is soft).
+        cf = (cloud_mask > 0.25).mean()
         if cf < self.min_cloud_fraction or cf > self.max_cloud_fraction:
             return self.__getitem__(self.rng.randint(0, len(self) - 1))
 

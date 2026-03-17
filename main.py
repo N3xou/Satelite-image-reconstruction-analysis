@@ -38,8 +38,8 @@ class Config:
     S2_BANDS = list(range(1, 14))
     PATCH_SIZE = 256
     DATA_FRACTION = 0.05 # Use % of data for quick training
-    min_cloud_fraction = 0.1
-    max_cloud_fraction = 0.9
+    min_cloud_fraction = 0.4
+    max_cloud_fraction = 0.6
     # Training
     FOLDS = 3
     BATCH_SIZE = 6
@@ -50,12 +50,12 @@ class Config:
     NUM_WORKERS = 4
 
     # Models to train
-    MODELS = ['SimpleCNN']
+    MODELS = ['UNet']
     #MODELS = ['SimpleCNN', 'UNet', 'RandomForest']  # Fast models for demo
-    #MODELS = ['SimpleCNN', 'UNet', 'GAN', 'RandomForest', 'Diffusion']  # All models
+    #MODELS = ['SimpleCNN', 'UNet', 'GAN', 'RandomForest', 'Diffusion', 'DSen2CR']  # All models
 
     # Output
-    OUTPUT_DIR = Path("./resultsTest")
+    OUTPUT_DIR = Path("./resultsTestCloudM50")
     SAVE_MODELS = True
 
 # ==================== 2. DATA EXPLORATION & INSIGHTS ====================
@@ -183,10 +183,6 @@ class ModelEvaluator:
                 cloud_mask = cloud_mask.to(self.device, non_blocking=True)
 
                 model_input = torch.cat([s1, s2_cloudy], dim=1)
-
-                # Handle LSTM special input
-                if 'LSTM' in model_name:
-                    model_input = model_input.unsqueeze(1)
 
                 # Measure inference time
                 if self.device == 'cuda':
