@@ -17,13 +17,13 @@ class Config:
     SEASONS            = None              # None = all four seasons
     S2_BANDS           = list(range(1, 14))  # all 13 Sentinel-2 bands
     PATCH_SIZE         = 256
-    DATA_FRACTION      = 0.05             # fraction of scenes to load
-    MIN_CLOUD_FRACTION = 0.1              # discard patches with less cloud
+    DATA_FRACTION      = 0.15             # fraction of scenes to load
+    MIN_CLOUD_FRACTION = 0.2              # discard patches with less cloud
     MAX_CLOUD_FRACTION = 0.7              # discard patches with more cloud
 
     # Cloud mask mode fed to SEN12MSCRDataset
     # Options: "combined" | "gt_diff" | "gt_threshold" | "spectral" | "sar_optical"
-    CLOUD_MASK_MODE    = "gt_diff"
+    CLOUD_MASK_MODE    = "combined"
 
     # ------------------------------------------------------------------
     # Loss function
@@ -62,7 +62,7 @@ class Config:
     # Models to train
     # Choices: "SimpleCNN" | "UNet" | "GAN" | "DSen2CR" | "Diffusion" | "RandomForest"
     # ------------------------------------------------------------------
-    MODELS = ["UNet"]
+    MODELS = ["GAN", "UNet", "RandomForest"]
     # MODELS = ["SimpleCNN", "UNet", "RandomForest"]
     # MODELS = ["SimpleCNN", "UNet", "GAN", "DSen2CR", "Diffusion", "RandomForest"]
 
