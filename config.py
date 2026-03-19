@@ -17,9 +17,9 @@ class Config:
     SEASONS            = None              # None = all four seasons
     S2_BANDS           = list(range(1, 14))  # all 13 Sentinel-2 bands
     PATCH_SIZE         = 256
-    DATA_FRACTION      = 0.05             # fraction of scenes to load
+    DATA_FRACTION      = 0.1             # fraction of scenes to load
     MIN_CLOUD_FRACTION = 0.1              # discard patches with less cloud
-    MAX_CLOUD_FRACTION = 0.7              # discard patches with more cloud
+    MAX_CLOUD_FRACTION = 0.5              # discard patches with more cloud
 
     # Cloud mask mode fed to SEN12MSCRDataset.
     #
@@ -57,7 +57,7 @@ class Config:
 
     # Weight of gt_diff component in "combined" mode (0–1).
     # The physics component (feature_detector) receives weight 1 - this value.
-    GT_DIFF_WEIGHT      = 0.6
+    GT_DIFF_WEIGHT      = 0.7
 
     # ------------------------------------------------------------------
     # Loss function
@@ -75,11 +75,11 @@ class Config:
     #     DSen2-CR       : CARL  (unchanged — already optimal)
     #     Diffusion      : diffusion_noise_loss
     #                      upweights noise-prediction error on cloud pixels
-    LOSS_TYPE          = "MRL"            # "basic" | "MRL"
+    LOSS_TYPE          = "basic"            # "basic" | "MRL"
 
     # MRL-specific weights (only used when LOSS_TYPE == "MRL")
     MRL_CLOUD_WEIGHT   = 3.0   # multiplier on cloud-pixel reconstruction error
-    MRL_CLEAR_PRESERVE = 2.0   # multiplier on clear-pixel modification penalty
+    MRL_CLEAR_PRESERVE = 5.0   # multiplier on clear-pixel modification penalty
     MRL_DIFF_CLOUD_W   = 3.0   # cloud upweight for diffusion noise loss
 
     # ------------------------------------------------------------------
@@ -97,13 +97,13 @@ class Config:
     # Choices: "SimpleCNN" | "UNet" | "GAN" | "DSen2CR" | "Diffusion" | "RandomForest"
     # ------------------------------------------------------------------
     MODELS = ["UNet"]
-    # MODELS = ["SimpleCNN", "UNet", "RandomForest"]
+    # MODELS = ["GAN", "UNet", "RandomForest"]
     # MODELS = ["SimpleCNN", "UNet", "GAN", "DSen2CR", "Diffusion", "RandomForest"]
 
     # ------------------------------------------------------------------
     # Output
     # ------------------------------------------------------------------
-    OUTPUT_DIR   = Path("./MRLresults")
+    OUTPUT_DIR   = Path("./MRLresults2")
     SAVE_MODELS  = True
 
     # ------------------------------------------------------------------
