@@ -19,6 +19,16 @@ from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
 try:
+    import scipy
+    import scipy.signal as scisig
+    import scipy.ndimage
+    SCIPY_AVAILABLE = True
+except ImportError:
+    print("WARNING: scipy not installed — feature_detector cloud mask will use fallback smoothing.")
+    print("Install: pip install scipy")
+    SCIPY_AVAILABLE = False
+
+try:
     import rasterio
     RASTERIO_AVAILABLE = True
 except ImportError:
@@ -59,9 +69,9 @@ class Seasons(Enum):
     """Available seasons in SEN12MS-CR"""
     SPRING = "ROIs1158_spring"
     SUMMER = "ROIs1868_summer"
-    FALL = "ROIs1970_fall"
+    FALL   = "ROIs1970_fall"
     WINTER = "ROIs2017_winter"
-    ALL = [SPRING, SUMMER, FALL, WINTER]
+    ALL    = [SPRING, SUMMER, FALL, WINTER]
 
 
 # ==================== TAR EXTRACTOR ====================
@@ -165,47 +175,76 @@ class CloudMaskComputer:
 
     Modes
     -----
-    "gt_diff"      : Ground-truth difference mask.
-                     Uses |cloudy - clean| per pixel, averaged across bands.
-                     Most accurate — only possible because we have paired data.
+    "gt_diff"         : Ground-truth difference mask.
+                        Uses |cloudy - clean| per pixel, averaged across bands.
+                        Most accurate — only possible because we have paired data.
 
-    "gt_threshold" : Hard binary mask from ground-truth difference.
-                     Pixels where mean absolute diff > `gt_threshold` are
-                     flagged as cloudy.  Returns float in {0, 1}.
+    "gt_threshold"    : Hard binary mask from ground-truth difference.
+                        Pixels where mean absolute diff > `gt_threshold` are
+                        flagged as cloudy.  Returns float in {0, 1}.
 
-    "spectral"     : Physics-based spectral mask.
-                     Combines brightness, Blue/NIR haze ratio and SWIR
-                     cirrus band (B10 at index 10 when all 13 bands present).
-                     Doesn't need the clean image; useful at inference time.
+    "feature_detector": Physics-based cloud detection ported from the DSen2-CR
+                        reference implementation (feature_detectors.py).
+                        Uses a minimum-score progressive elimination strategy:
+                        every pixel starts as cloud (score=1.0) and evidence
+                        against cloud pulls the score down.  Tests brightness
+                        in blue, aerosol/cirrus, all-visible, moisture (optional),
+                        and snow/ice (NDSI).  Morphological grey-closing + box
+                        blur applied for spatial coherence.
+                        Does not require the clean image — usable at inference.
+                        Optionally includes a shadow component (values < 0 mapped
+                        to 0.0 in the soft mask; shadow_as_cloud=True maps them
+                        to the same positive weight as cloud).
 
-    "sar_optical"  : Original SAR vs. optical disagreement heuristic
-                     (kept for backward compatibility / ablation studies).
+    "spectral"        : Simplified physics-based mask (brightness + Blue/NIR
+                        haze ratio + cirrus band).  Kept for ablation / when
+                        scipy is unavailable.  Does not need the clean image.
 
-    "combined"     : Weighted blend of gt_diff + spectral.
-                     Best of both worlds for training: supervised signal
-                     guides the mask while spectral features keep it
-                     physically interpretable.
+    "sar_optical"     : SAR vs. optical disagreement heuristic
+                        (kept for backward compatibility / ablation studies).
+
+    "combined"        : Weighted blend of gt_diff + feature_detector.
+                        Best of both worlds for training.
 
     Parameters
     ----------
-    mode          : one of the strings above (default: "combined")
-    gt_diff_weight: weight of gt_diff component in "combined" mode (0-1)
-    gt_threshold  : threshold for "gt_threshold" mode (default: 0.10)
+    mode              : one of the strings above (default: "gt_diff")
+    gt_diff_weight    : weight of gt_diff component in "combined" mode (0-1)
+    gt_threshold      : threshold for "gt_threshold" mode (default: 0.10)
+    cloud_threshold   : binarisation threshold for "feature_detector" mode
+                        when binarize=True (default: 0.35)
+    use_moist_check   : enable NDMI moisture check in "feature_detector"
+                        (slightly more accurate, requires B08 + B11)
+    shadow_as_cloud   : if True, shadow pixels (negative score from shadow
+                        detector) are treated as cloud in the soft mask rather
+                        than zero.  Default False — shadow ≠ cloud for the
+                        reconstruction objective.
     """
 
-    MODES = {"gt_diff", "gt_threshold", "spectral", "sar_optical", "combined"}
+    MODES = {
+        "gt_diff", "gt_threshold", "spectral",
+        "sar_optical", "combined", "feature_detector",
+    }
 
     def __init__(
         self,
-        mode: str = "combined",
+        mode: str             = "gt_diff",
         gt_diff_weight: float = 0.6,
-        gt_threshold: float = 0.10,
+        gt_threshold: float   = 0.10,
+        cloud_threshold: float = 0.35,
+        use_moist_check: bool  = False,
+        shadow_as_cloud: bool  = False,
     ):
         if mode not in self.MODES:
-            raise ValueError(f"Unknown cloud_mask_mode '{mode}'. Choose from {self.MODES}")
-        self.mode = mode
-        self.gt_diff_weight = gt_diff_weight
-        self.gt_threshold = gt_threshold
+            raise ValueError(
+                f"Unknown cloud_mask_mode '{mode}'. Choose from {self.MODES}"
+            )
+        self.mode             = mode
+        self.gt_diff_weight   = gt_diff_weight
+        self.gt_threshold     = gt_threshold
+        self.cloud_threshold  = cloud_threshold
+        self.use_moist_check  = use_moist_check
+        self.shadow_as_cloud  = shadow_as_cloud
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -214,19 +253,20 @@ class CloudMaskComputer:
     def compute(
         self,
         s2_cloudy: np.ndarray,
-        s2_clean: np.ndarray,
-        s1: np.ndarray,
-        s2_bands: list,
+        s2_clean:  np.ndarray,
+        s1:        np.ndarray,
+        s2_bands:  list,
     ) -> np.ndarray:
         """
         Compute cloud mask.
 
         Parameters
         ----------
-        s2_cloudy : float32 array [C, H, W], normalised to [0,1]
-        s2_clean  : float32 array [C, H, W], normalised to [0,1]
-        s1        : float32 array [2, H, W], normalised to [0,1]
+        s2_cloudy : float32 array [C, H, W], normalised to [0, 1]
+        s2_clean  : float32 array [C, H, W], normalised to [0, 1]
+        s1        : float32 array [2, H, W], normalised to [0, 1]
         s2_bands  : list of 1-based Sentinel-2 band indices loaded
+                    (e.g. [1,2,...,13] or [2,3,4,8])
 
         Returns
         -------
@@ -235,16 +275,21 @@ class CloudMaskComputer:
         if self.mode == "gt_diff":
             return self._gt_diff(s2_cloudy, s2_clean)
         elif self.mode == "gt_threshold":
-            return self._gt_threshold(s2_cloudy, s2_clean)
+            return self._gt_threshold(s2_cloudy, s2_clean, self.gt_threshold)
         elif self.mode == "spectral":
             return self._spectral(s2_cloudy, s2_bands)
         elif self.mode == "sar_optical":
             return self._sar_optical(s1, s2_cloudy)
+        elif self.mode == "feature_detector":
+            return self._feature_detector(s2_cloudy, s2_bands,
+                                           self.cloud_threshold,
+                                           self.use_moist_check,
+                                           self.shadow_as_cloud)
         elif self.mode == "combined":
             return self._combined(s2_cloudy, s2_clean, s1, s2_bands)
 
     # ------------------------------------------------------------------
-    # Individual methods
+    # gt_diff  (ground-truth difference — supervised)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -273,9 +318,13 @@ class CloudMaskComputer:
             1.0  = diff ≥0.30  (thick cloud)
         """
         diff = np.abs(s2_cloudy.astype(np.float32) - s2_clean.astype(np.float32))
-        mask = diff.mean(axis=0)                     # [H, W], values in [0, 1]
-        mask = np.clip(mask / 0.30, 0.0, 1.0)       # fixed physical scale
-        return mask[None, :, :].astype(np.float32)  # [1, H, W]
+        mask = diff.mean(axis=0)                      # [H, W], values in [0, 1]
+        mask = np.clip(mask / 0.30, 0.0, 1.0)        # fixed physical scale
+        return mask[None, :, :].astype(np.float32)   # [1, H, W]
+
+    # ------------------------------------------------------------------
+    # gt_threshold  (hard binary from ground truth)
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _gt_threshold(s2_cloudy: np.ndarray, s2_clean: np.ndarray,
@@ -292,16 +341,203 @@ class CloudMaskComputer:
 
         # Simple 3×3 max-pool dilation (pure numpy, no scipy dependency)
         from numpy.lib.stride_tricks import sliding_window_view
-        pad = np.pad(mask, 1, mode='edge')
+        pad     = np.pad(mask, 1, mode='edge')
         windows = sliding_window_view(pad, (3, 3))
-        mask = windows.max(axis=(-2, -1))
+        mask    = windows.max(axis=(-2, -1))
 
         return mask[None, :, :].astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # feature_detector  (DSen2-CR reference algorithm, adapted)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _feature_detector(
+        s2_cloudy:        np.ndarray,
+        s2_bands:         list,
+        cloud_threshold:  float = 0.35,
+        use_moist_check:  bool  = False,
+        shadow_as_cloud:  bool  = False,
+    ) -> np.ndarray:
+        """
+        Physics-based cloud mask ported from the DSen2-CR reference
+        implementation (feature_detectors.py  →  get_cloud_mask /
+        get_cloud_cloudshadow_mask).
+
+        Algorithm — progressive minimum-score elimination
+        --------------------------------------------------
+        Start with every pixel at score = 1.0 (assumed cloud).
+        Use np.minimum to reduce the score whenever a pixel fails a
+        cloud test.  Any single low-scoring test can pull the pixel
+        toward "clear".
+
+        Tests applied (in order):
+          1. Blue band (B02) brightness       – clouds are bright in blue
+          2. Aerosol (B01) brightness         – cirrus / optically thin cloud
+          3. Aerosol + cirrus (B01+B10)       – combined thin-cloud signal
+          4. All-visible sum (B02+B03+B04)    – broadband brightness
+          5. NDMI moisture check (optional)   – clouds are moist (B08, B11)
+          6. NDSI snow guard (B03, B11)       – snow ≠ cloud: snow has high
+                                                NDSI, so high NDSI → not cloud
+
+        Post-processing:
+          - Morphological grey-closing (5×5) fills small holes in cloud mask
+          - 7×7 box blur smooths cloud edges
+
+        Shadow detection (optional)
+        ---------------------------
+        A separate Cloud Shadow Index (CSI = (NIR + SWIR1) / 2) identifies
+        dark pixels that are geometrically below cloud level.  In the output:
+          shadow_as_cloud=False  →  shadow pixels are treated as clear (0.0)
+          shadow_as_cloud=True   →  shadow pixels are given the same weight
+                                    as cloud (useful if you want the model to
+                                    also reconstruct shadowed regions)
+
+        Band fallback behaviour
+        -----------------------
+        Every test checks whether the required band is present in s2_bands
+        before using it.  If a required band is absent the test is skipped
+        gracefully (or replaced with a zero contribution), so the method
+        works even with reduced band sets like [2,3,4,8].
+
+        Input
+        -----
+        s2_cloudy   : float32 [C, H, W], normalised to [0, 1]
+                      (the method rescales to [0, 10000] internally to match
+                      the original algorithm's expected input range)
+        s2_bands    : list of 1-based band indices corresponding to the
+                      channels in s2_cloudy (e.g. list(range(1,14)))
+
+        Returns
+        -------
+        mask : float32 [1, H, W] in [0, 1]
+               Values near 1.0 = cloud (or shadow if shadow_as_cloud=True).
+               Values near 0.0 = clear / shadow (depending on flag).
+        """
+        # ---- helpers ----
+        def _rescale(data, lo, hi):
+            """Linear rescale from [lo,hi] to [0,1], clipped."""
+            return np.clip((data - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+
+        def _norm_diff(ch1, ch2):
+            """Normalised difference index; guards against zero denominator."""
+            denom = ch1 + ch2
+            denom[denom == 0] = 0.001
+            return (ch1 - ch2) / denom
+
+        # Build a band-index lookup: 1-based band number → array channel index
+        band_idx = {b: i for i, b in enumerate(s2_bands)}
+
+        # Rescale to DN [0, 10000] to match the original algorithm's thresholds
+        img = s2_cloudy.astype(np.float32) * 10000.0   # [C, H, W]
+
+        C, H, W = img.shape
+        score   = np.ones((H, W), dtype=np.float32)    # start: every pixel is cloud
+
+        # ---- Test 1: Blue band (B02, 1-based index 2) ----
+        # Threshold range [0.1, 0.5] × 10000 → [1000, 5000]
+        if 2 in band_idx:
+            score = np.minimum(score, _rescale(img[band_idx[2]], 1000., 5000.))
+
+        # ---- Test 2: Aerosol band (B01, 1-based index 1) ----
+        # Threshold range [0.1, 0.3] × 10000 → [1000, 3000]
+        if 1 in band_idx:
+            score = np.minimum(score, _rescale(img[band_idx[1]], 1000., 3000.))
+
+        # ---- Test 3: Aerosol + cirrus combined (B01 + B10) ----
+        # Threshold range [0.15, 0.2] × 10000 → [1500, 2000]
+        # Falls back to aerosol-only or is skipped if both unavailable.
+        if 1 in band_idx and 11 in band_idx:
+            # B10 is 1-based band 11 (SWIR Cirrus at 1375 nm)
+            combined_ac = img[band_idx[1]] + img[band_idx[11]]
+            score = np.minimum(score, _rescale(combined_ac, 1500., 2000.))
+        elif 1 in band_idx:
+            # Aerosol alone as a stand-in; upscale range slightly
+            score = np.minimum(score, _rescale(img[band_idx[1]], 1500., 2000.))
+
+        # ---- Test 4: All-visible sum (B02 + B03 + B04) ----
+        # Threshold range [0.2, 0.8] × 10000 → [2000, 8000]
+        vis_indices = [band_idx[b] for b in [2, 3, 4] if b in band_idx]
+        if vis_indices:
+            vis_sum = img[vis_indices].sum(axis=0)
+            # Scale range proportionally to number of bands present
+            scale   = len(vis_indices) / 3.0
+            score   = np.minimum(score,
+                                  _rescale(vis_sum, 2000. * scale, 8000. * scale))
+
+        # ---- Test 5: NDMI moisture check (optional, B08 + B11) ----
+        # Clouds are moist: high NDMI.
+        # Threshold range [-0.1, 0.1]  (dimensionless, already in [-1,1])
+        if use_moist_check and 8 in band_idx and 12 in band_idx:
+            nir   = img[band_idx[8]]  / 10000.0
+            swir1 = img[band_idx[12]] / 10000.0
+            ndmi  = _norm_diff(nir, swir1)
+            score = np.minimum(score, _rescale(ndmi, -0.1, 0.1))
+
+        # ---- Test 6: NDSI snow guard (B03 + B11) ----
+        # Snow is NOT cloud.  High NDSI → snow → reduce cloud score.
+        # Original: rescale NDSI from [0.8, 0.6] → inverted range (snow guard).
+        # Band mapping: B03 = 1-based 3, B11 = 1-based 12
+        if 3 in band_idx and 12 in band_idx:
+            green = img[band_idx[3]]  / 10000.0
+            swir1 = img[band_idx[12]] / 10000.0
+            ndsi  = _norm_diff(green, swir1)
+            # Original uses (0.8, 0.6) — inverted so high NDSI → low score
+            score = np.minimum(score, _rescale(ndsi, 0.8, 0.6))
+
+        # ---- Post-processing: morphological closing + box blur ----
+        if SCIPY_AVAILABLE:
+            score = scipy.ndimage.grey_closing(score, size=(5, 5))
+            box   = np.ones((7, 7), dtype=np.float32) / 49.0
+            score = scisig.convolve2d(score, box, mode='same').astype(np.float32)
+        else:
+            # Pure-numpy fallback: uniform average over 7×7 neighbourhood
+            from numpy.lib.stride_tricks import sliding_window_view
+            pad   = np.pad(score, 3, mode='edge')
+            wins  = sliding_window_view(pad, (7, 7))
+            score = wins.mean(axis=(-2, -1)).astype(np.float32)
+
+        score = np.clip(score, 0.0, 1.0)
+
+        # ---- Shadow detection (optional) ----
+        # Uses CSI = (NIR + SWIR1) / 2 and blue darkness.
+        # B08 = 1-based 8, B11 = 1-based 12, B02 = 1-based 2
+        if 8 in band_idx and 12 in band_idx and 2 in band_idx:
+            nir   = img[band_idx[8]]  / 10000.0
+            swir1 = img[band_idx[12]] / 10000.0
+            blue  = img[band_idx[2]]  / 10000.0
+
+            csi   = (nir + swir1) / 2.0
+
+            # Adaptive thresholds (same as original feature_detectors.py)
+            T3 = float(np.min(csi) + (3/4) * (np.mean(csi) - np.min(csi)))
+            T4 = float(np.min(blue) + (5/6) * (np.mean(blue) - np.min(blue)))
+
+            shadow_mask = np.zeros((H, W), dtype=np.float32)
+            shadow_tf   = (csi < T3) & (blue < T4)
+            shadow_mask[shadow_tf] = 1.0
+
+            # Smooth shadow mask with 5×5 median (original uses medfilt2d)
+            if SCIPY_AVAILABLE:
+                shadow_mask = scisig.medfilt2d(shadow_mask, 5)
+            shadow_mask = np.clip(shadow_mask, 0.0, 1.0).astype(np.float32)
+
+            if shadow_as_cloud:
+                # Treat detected shadow pixels with the same weight as cloud
+                score = np.maximum(score, shadow_mask)
+            # If shadow_as_cloud=False, shadow pixels already score near 0
+            # from low-brightness tests, so no explicit action needed.
+
+        return score[None, :, :].astype(np.float32)   # [1, H, W]
+
+    # ------------------------------------------------------------------
+    # spectral  (simplified physics-based, kept for ablation)
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _spectral(s2_cloudy: np.ndarray, s2_bands: list) -> np.ndarray:
         """
-        Physics-based spectral cloud mask.
+        Simplified physics-based spectral cloud mask.
 
         Uses three complementary signals:
         1. Visible brightness  – clouds are bright across all bands.
@@ -312,6 +548,11 @@ class CloudMaskComputer:
 
         Each component is individually normalised then blended with
         empirically chosen weights.
+
+        Note: prefer "feature_detector" mode over this one — it applies
+        the more rigorous progressive-elimination algorithm from the DSen2-CR
+        reference implementation, including snow discrimination and spatial
+        smoothing.  This method is kept for ablation / scipy-free fallback.
         """
         band_idx = {b: i for i, b in enumerate(s2_bands)}
 
@@ -333,28 +574,33 @@ class CloudMaskComputer:
         b08_available = 8 in band_idx
 
         if b02_available and b08_available:
-            blue = s2_cloudy[band_idx[2]]
-            nir  = s2_cloudy[band_idx[8]]
-            # High ratio → haze / thin clouds; cap at 2 to avoid div-by-zero
+            blue      = s2_cloudy[band_idx[2]]
+            nir       = s2_cloudy[band_idx[8]]
             haze_ratio = np.clip(blue / (nir + 1e-6), 0.0, 2.0) / 2.0
-            haze_norm = _norm(haze_ratio)
+            haze_norm  = _norm(haze_ratio)
         else:
-            haze_norm = np.zeros_like(brightness_norm)
+            haze_norm  = np.zeros_like(brightness_norm)
 
-        # 3. Cirrus band (B10, index 10 in 1-based numbering)
-        if 10 in band_idx:
-            cirrus = s2_cloudy[band_idx[10]]
+        # 3. Cirrus band (B10, 1-based index 11 in the S2Bands enum)
+        # Note: B10 in the original feature_detectors.py is at numpy index 10
+        # which corresponds to 1-based band 11 in our loader.
+        if 11 in band_idx:
+            cirrus      = s2_cloudy[band_idx[11]]
             cirrus_norm = _norm(cirrus)
-            weights = (0.45, 0.30, 0.25)
+            weights     = (0.45, 0.30, 0.25)
         else:
             cirrus_norm = np.zeros_like(brightness_norm)
-            weights = (0.55, 0.45, 0.0)
+            weights     = (0.55, 0.45, 0.0)
 
         mask = (weights[0] * brightness_norm
                 + weights[1] * haze_norm
                 + weights[2] * cirrus_norm)
 
         return mask[None, :, :].astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # sar_optical  (legacy heuristic)
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _sar_optical(s1: np.ndarray, s2_cloudy: np.ndarray) -> np.ndarray:
@@ -373,18 +619,24 @@ class CloudMaskComputer:
         mask = opt * (1.0 - sar)
         return mask[None, :, :].astype(np.float32)
 
+    # ------------------------------------------------------------------
+    # combined  (supervised gt_diff + feature_detector blend)
+    # ------------------------------------------------------------------
+
     def _combined(
         self,
         s2_cloudy: np.ndarray,
-        s2_clean: np.ndarray,
-        s1: np.ndarray,
-        s2_bands: list,
+        s2_clean:  np.ndarray,
+        s1:        np.ndarray,
+        s2_bands:  list,
     ) -> np.ndarray:
         """
-        Weighted blend: gt_diff + spectral.
+        Weighted blend: gt_diff + feature_detector.
 
         gt_diff provides an accurate supervised signal using a fixed physical
-        scale (see _gt_diff).  spectral adds texture (cirrus, haze).
+        scale (see _gt_diff).  feature_detector adds physically-grounded
+        spectral texture from the DSen2-CR reference algorithm (snow guard,
+        aerosol, cirrus) with morphological post-processing.
 
         The second p99 re-normalisation that was here previously was removed:
         it was compounding the per-image bias already present in gt_diff,
@@ -393,11 +645,20 @@ class CloudMaskComputer:
 
         Both components are already in [0,1] on compatible scales, so a
         weighted sum followed by a simple clip is sufficient.
-        """
-        gt   = self._gt_diff(s2_cloudy, s2_clean)         # [0,1], fixed scale
-        spec = self._spectral(s2_cloudy, s2_bands)         # [0,1], per-image norm
 
-        combined = self.gt_diff_weight * gt + (1.0 - self.gt_diff_weight) * spec
+        If scipy is unavailable, falls back to the simpler spectral method
+        for the physics component.
+        """
+        gt = self._gt_diff(s2_cloudy, s2_clean)       # [0,1], fixed physical scale
+
+        phys = self._feature_detector(
+            s2_cloudy, s2_bands,
+            cloud_threshold=self.cloud_threshold,
+            use_moist_check=self.use_moist_check,
+            shadow_as_cloud=self.shadow_as_cloud,
+        )                                               # [0,1], DSen2-CR algorithm
+
+        combined = self.gt_diff_weight * gt + (1.0 - self.gt_diff_weight) * phys
         return np.clip(combined, 0.0, 1.0).astype(np.float32)
 
 
@@ -427,13 +688,13 @@ class SEN12MSCRDataset(Dataset):
 
     Cloud mask modes
     ----------------
-    "combined"     : (default) Supervised gt_diff + spectral blend.
-                      Most informative for training.
-    "gt_diff"      : Soft mask from |cloudy - clean|.  Exact but soft.
-    "gt_threshold" : Hard binary mask from |cloudy - clean|.
-    "spectral"     : Physics-based (brightness + haze + cirrus).
-                      Usable at inference time without ground truth.
-    "sar_optical"  : Legacy SAR vs optical disagreement.
+    "gt_diff"          : (default) Soft supervised mask from |cloudy - clean|.
+    "gt_threshold"     : Hard binary mask from |cloudy - clean|.
+    "feature_detector" : DSen2-CR reference algorithm (progressive min-score).
+                         Recommended for inference (no clean image required).
+    "spectral"         : Simplified brightness + haze + cirrus blend.
+    "sar_optical"      : Legacy SAR vs optical disagreement.
+    "combined"         : gt_diff + feature_detector blend (best for training).
     """
 
     def __init__(
@@ -446,20 +707,26 @@ class SEN12MSCRDataset(Dataset):
         min_cloud_fraction=0.05,
         max_cloud_fraction=0.9,
         random_seed=42,
-        cloud_mask_mode: str = "combined",
-        gt_diff_weight: float = 0.6,
-        gt_threshold: float = 0.10,
+        cloud_mask_mode: str   = "gt_diff",
+        gt_diff_weight: float  = 0.6,
+        gt_threshold: float    = 0.10,
+        cloud_threshold: float = 0.35,
+        use_moist_check: bool  = False,
+        shadow_as_cloud: bool  = False,
     ):
-        self.root_dir = Path(root_dir)
-        self.patch_size = patch_size
-        self.min_cloud_fraction = min_cloud_fraction
-        self.max_cloud_fraction = max_cloud_fraction
-        self.rng = random.Random(random_seed)
+        self.root_dir             = Path(root_dir)
+        self.patch_size           = patch_size
+        self.min_cloud_fraction   = min_cloud_fraction
+        self.max_cloud_fraction   = max_cloud_fraction
+        self.rng                  = random.Random(random_seed)
 
         self.mask_computer = CloudMaskComputer(
-            mode=cloud_mask_mode,
-            gt_diff_weight=gt_diff_weight,
-            gt_threshold=gt_threshold,
+            mode             = cloud_mask_mode,
+            gt_diff_weight   = gt_diff_weight,
+            gt_threshold     = gt_threshold,
+            cloud_threshold  = cloud_threshold,
+            use_moist_check  = use_moist_check,
+            shadow_as_cloud  = shadow_as_cloud,
         )
 
         # Seasons
@@ -483,17 +750,16 @@ class SEN12MSCRDataset(Dataset):
         scenes = defaultdict(list)
 
         for season in seasons:
-            s1_dir = self.root_dir / f"{season}_s1"
-            s2_dir = self.root_dir / f"{season}_s2"
+            s1_dir  = self.root_dir / f"{season}_s1"
+            s2_dir  = self.root_dir / f"{season}_s2"
             s2c_dir = self.root_dir / f"{season}_s2_cloudy"
 
             if not (s1_dir.exists() and s2_dir.exists() and s2c_dir.exists()):
                 continue
 
             for s2_scene in sorted(s2_dir.glob("s2_*")):
-                scene_id = s2_scene.name.split("_")[1]
-
-                s1_scene = s1_dir / f"s1_{scene_id}"
+                scene_id  = s2_scene.name.split("_")[1]
+                s1_scene  = s1_dir  / f"s1_{scene_id}"
                 s2c_scene = s2c_dir / f"s2_cloudy_{scene_id}"
 
                 if not (s1_scene.exists() and s2c_scene.exists()):
@@ -509,8 +775,8 @@ class SEN12MSCRDataset(Dataset):
 
                     if cloudy_patch.exists() and s1_patch.exists():
                         scenes[(season, scene_id)].append({
-                            "s1": s1_patch,
-                            "s2_clean": clean_patch,
+                            "s1":        s1_patch,
+                            "s2_clean":  clean_patch,
                             "s2_cloudy": cloudy_patch
                         })
 
@@ -520,7 +786,7 @@ class SEN12MSCRDataset(Dataset):
         scene_keys = list(scenes.keys())
         self.rng.shuffle(scene_keys)
 
-        num_scenes = max(1, int(len(scene_keys) * data_fraction))
+        num_scenes     = max(1, int(len(scene_keys) * data_fraction))
         selected_scenes = scene_keys[:num_scenes]
 
         self.samples = [
@@ -555,7 +821,7 @@ class SEN12MSCRDataset(Dataset):
     # --------------------------------------------------
     def random_crop(self, *arrays):
         _, H, W = arrays[0].shape
-        ps = self.patch_size
+        ps      = self.patch_size
 
         if H <= ps or W <= ps:
             return arrays
@@ -601,16 +867,16 @@ class SEN12MSCRDataset(Dataset):
             s2_clean = src.read(self.s2_bands).astype(np.float32)
 
         # Normalize
-        s1 = self.normalize_s1(s1)
+        s1        = self.normalize_s1(s1)
         s2_cloudy = self.normalize_s2(s2_cloudy)
-        s2_clean = self.normalize_s2(s2_clean)
+        s2_clean  = self.normalize_s2(s2_clean)
 
         # Compute cloud mask (uses clean image when available)
         cloud_mask = self.mask_computer.compute(
-            s2_cloudy=s2_cloudy,
-            s2_clean=s2_clean,
-            s1=s1,
-            s2_bands=self.s2_bands,
+            s2_cloudy = s2_cloudy,
+            s2_clean  = s2_clean,
+            s1        = s1,
+            s2_bands  = self.s2_bands,
         )
 
         # Random crop
@@ -627,10 +893,10 @@ class SEN12MSCRDataset(Dataset):
             return self.__getitem__(self.rng.randint(0, len(self) - 1))
 
         return (
-            torch.from_numpy(s1),          # (2, H, W)
-            torch.from_numpy(s2_cloudy),   # (C, H, W)
-            torch.from_numpy(s2_clean),    # (C, H, W)
-            torch.from_numpy(cloud_mask)   # (1, H, W)
+            torch.from_numpy(s1),           # (2, H, W)
+            torch.from_numpy(s2_cloudy),    # (C, H, W)
+            torch.from_numpy(s2_clean),     # (C, H, W)
+            torch.from_numpy(cloud_mask)    # (1, H, W)
         )
 
 
@@ -638,11 +904,11 @@ class SEN12MSCRSplitter:
     """Split and organize SEN12MS-CR dataset into train/val/small directories"""
 
     def __init__(self, base_dir='./sen12mscr_dataset', output_dir='./processed_data'):
-        self.base_dir = Path(base_dir)
+        self.base_dir   = Path(base_dir)
         self.output_dir = Path(output_dir)
 
         self.train_dir = self.output_dir / 'train'
-        self.val_dir = self.output_dir / 'val'
+        self.val_dir   = self.output_dir / 'val'
         self.small_dir = self.output_dir / 'small'
 
         for dir_path in [self.train_dir, self.val_dir, self.small_dir]:
@@ -672,7 +938,7 @@ class SEN12MSCRSplitter:
         samples = []
 
         for season in seasons:
-            s2_root = self.base_dir / f'{season}_s2'
+            s2_root       = self.base_dir / f'{season}_s2'
             s2cloudy_root = self.base_dir / f'{season}_s2_cloudy'
 
             if not s2_root.exists() or not s2cloudy_root.exists():
@@ -683,22 +949,22 @@ class SEN12MSCRSplitter:
             season_samples = 0
 
             for s2_scene_dir in sorted(s2_root.glob('s2_*')):
-                scene_id = s2_scene_dir.name.split('_')[1]
+                scene_id          = s2_scene_dir.name.split('_')[1]
                 s2cloudy_scene_dir = s2cloudy_root / f's2_cloudy_{scene_id}'
 
                 if not s2cloudy_scene_dir.exists():
                     continue
 
                 for s2_patch_path in sorted(s2_scene_dir.glob('*.tif')):
-                    patch_filename = s2_patch_path.name
+                    patch_filename   = s2_patch_path.name
                     s2cloudy_filename = patch_filename.replace('_s2_', '_s2_cloudy_')
-                    s2cloudy_path = s2cloudy_scene_dir / s2cloudy_filename
+                    s2cloudy_path    = s2cloudy_scene_dir / s2cloudy_filename
 
                     if s2cloudy_path.exists():
                         samples.append({
-                            's2': s2_patch_path,
+                            's2':       s2_patch_path,
                             's2_cloudy': s2cloudy_path,
-                            'season': season,
+                            'season':   season,
                             'scene_id': scene_id
                         })
                         season_samples += 1
@@ -732,17 +998,17 @@ class SEN12MSCRSplitter:
             random_state=random_state
         )
 
-        train_samples = [s for k in train_keys for s in scenes[k]]
-        val_samples = [s for k in val_keys for s in scenes[k]]
-        small_samples = [s for k in small_keys for s in scenes[k]]
+        train_samples = [s for k in train_keys  for s in scenes[k]]
+        val_samples   = [s for k in val_keys    for s in scenes[k]]
+        small_samples = [s for k in small_keys  for s in scenes[k]]
 
         print(f"\nSplit statistics:")
-        print(f"  Training:   {len(train_samples)} samples ({len(train_samples) / len(samples) * 100:.1f}%)")
-        print(f"  Validation: {len(val_samples)} samples ({len(val_samples) / len(samples) * 100:.1f}%)")
-        print(f"  Small:      {len(small_samples)} samples ({len(small_samples) / len(samples) * 100:.1f}%)")
+        print(f"  Training:   {len(train_samples)} samples ({len(train_samples)/len(samples)*100:.1f}%)")
+        print(f"  Validation: {len(val_samples)}   samples ({len(val_samples)/len(samples)*100:.1f}%)")
+        print(f"  Small:      {len(small_samples)} samples ({len(small_samples)/len(samples)*100:.1f}%)")
 
         self._save_split(train_samples, self.train_dir, "Training")
-        self._save_split(val_samples, self.val_dir, "Validation")
+        self._save_split(val_samples,   self.val_dir,   "Validation")
         self._save_split(small_samples, self.small_dir, "Small")
 
         print("\n" + "=" * 70)
@@ -752,7 +1018,7 @@ class SEN12MSCRSplitter:
     def _save_split(self, samples, output_dir, split_name):
         print(f"\nSaving {split_name} set...")
 
-        clean_dir = output_dir / 'clean'
+        clean_dir  = output_dir / 'clean'
         cloudy_dir = output_dir / 'cloudy'
 
         for idx, sample in enumerate(tqdm(samples, desc=f"Processing {split_name}")):
@@ -761,16 +1027,16 @@ class SEN12MSCRSplitter:
                     s2_cloudy = src.read(self.s2_bands)
 
                 with rasterio.open(sample['s2']) as src:
-                    s2_clean = src.read(self.s2_bands)
+                    s2_clean  = src.read(self.s2_bands)
 
                 s2_cloudy = s2_cloudy.astype(np.float32) / 10000.0
-                s2_clean = s2_clean.astype(np.float32) / 10000.0
+                s2_clean  = s2_clean.astype(np.float32)  / 10000.0
 
                 s2_cloudy = np.clip(s2_cloudy, 0, 1)
-                s2_clean = np.clip(s2_clean, 0, 1)
+                s2_clean  = np.clip(s2_clean,  0, 1)
 
                 filename = f"{sample['season']}_{sample['scene_id']}_{idx:05d}.npy"
-                np.save(clean_dir / filename, s2_clean)
+                np.save(clean_dir  / filename, s2_clean)
                 np.save(cloudy_dir / filename, s2_cloudy)
 
             except Exception as e:
@@ -798,35 +1064,35 @@ def visualize_sen12mscr_samples(dataset, n_samples=3, save_path='sen12mscr_sampl
             s2 = data[1]
         else:
             s2_cloudy = data[0]
-            s2 = data[1]
-            s1 = None
+            s2        = data[1]
+            s1        = None
 
         if s2_cloudy.shape[0] >= 13:
             cloudy_rgb = s2_cloudy[[3, 2, 1]].permute(1, 2, 0).numpy()
-            clean_rgb = s2[[3, 2, 1]].permute(1, 2, 0).numpy()
+            clean_rgb  = s2[[3, 2, 1]].permute(1, 2, 0).numpy()
         elif s2_cloudy.shape[0] >= 3:
             cloudy_rgb = s2_cloudy[:3].permute(1, 2, 0).numpy()
-            clean_rgb = s2[:3].permute(1, 2, 0).numpy()
+            clean_rgb  = s2[:3].permute(1, 2, 0).numpy()
         else:
             cloudy_rgb = s2_cloudy[0].numpy()
-            clean_rgb = s2[0].numpy()
+            clean_rgb  = s2[0].numpy()
 
         axes[i, 0].imshow(np.clip(cloudy_rgb, 0, 1))
-        axes[i, 0].set_title(f'Sample {i + 1}: S2 Cloudy')
+        axes[i, 0].set_title(f'Sample {i+1}: S2 Cloudy')
         axes[i, 0].axis('off')
 
         axes[i, 1].imshow(np.clip(clean_rgb, 0, 1))
-        axes[i, 1].set_title(f'Sample {i + 1}: S2 Clean')
+        axes[i, 1].set_title(f'Sample {i+1}: S2 Clean')
         axes[i, 1].axis('off')
 
         if s1 is not None:
             s1_img = s1[0].numpy()
             axes[i, 2].imshow(s1_img, cmap='gray')
-            axes[i, 2].set_title(f'Sample {i + 1}: S1 SAR (VV)')
+            axes[i, 2].set_title(f'Sample {i+1}: S1 SAR (VV)')
         else:
             diff = np.abs(cloudy_rgb - clean_rgb)
             axes[i, 2].imshow(diff)
-            axes[i, 2].set_title(f'Sample {i + 1}: Difference')
+            axes[i, 2].set_title(f'Sample {i+1}: Difference')
 
         axes[i, 2].axis('off')
 
@@ -881,7 +1147,7 @@ def split_interface():
         season_map = {
             "spring": "ROIs1158_spring",
             "summer": "ROIs1868_summer",
-            "fall": "ROIs1970_fall",
+            "fall":   "ROIs1970_fall",
             "winter": "ROIs2017_winter"
         }
         seasons = [season_map[s.strip().lower()] for s in seasons_input.split(',')]
@@ -904,7 +1170,6 @@ def split_interface():
             small_ratio=0.05,
             random_state=42
         )
-
         print("\n✓ Dataset processing complete!")
     else:
         print("Cancelled.")
@@ -952,7 +1217,6 @@ if __name__ == '__main__':
     elif choice == '2':
         extractor = SEN12MSCRExtractor('./sen12mscr_dataset')
         found = extractor.verify_structure()
-
         if found:
             print(f"\n✓ Dataset is ready to use!")
 
@@ -962,12 +1226,12 @@ if __name__ == '__main__':
         seasons = None if seasons_input.lower() == 'all' else [s.strip() for s in seasons_input.split(',')]
 
         try:
-            print("\nLoading with combined cloud mask (gt_diff + spectral)...")
+            print("\nLoading with feature_detector cloud mask...")
             train_dataset = SEN12MSCRDataset(
                 './sen12mscr_dataset',
                 seasons=seasons,
-                s2_bands=[2, 3, 4, 8],
-                cloud_mask_mode='combined',
+                s2_bands=list(range(1, 14)),
+                cloud_mask_mode='feature_detector',
             )
             print(f"\n✓ Successfully loaded {len(train_dataset)} samples")
 
@@ -977,7 +1241,7 @@ if __name__ == '__main__':
             print(f"✓ S2 clean shape:  {s2_clean.shape}")
             print(f"✓ Cloud mask shape:{cloud_mask.shape}")
             print(f"✓ Mask range:      [{cloud_mask.min():.3f}, {cloud_mask.max():.3f}]")
-            print(f"✓ Mean cloud frac: {cloud_mask.mean():.2%}")
+            print(f"✓ Coverage (>0.25):{(cloud_mask > 0.25).float().mean():.2%}")
 
         except Exception as e:
             print(f"\n✗ Error: {e}")

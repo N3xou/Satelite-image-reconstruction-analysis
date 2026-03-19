@@ -39,15 +39,15 @@ class ModelEvaluator:
     """Comprehensive model evaluation"""
 
     def __init__(self, device='cuda' if torch.cuda.is_available() else 'cpu'):
-        self.device = device
+        self.device  = device
         self.results = {}
 
     def evaluate_model(self, model, test_loader, model_name):
         """Evaluate single model with comprehensive metrics"""
         model.eval()
 
-        all_preds = []
-        all_targets = []
+        all_preds      = []
+        all_targets    = []
         inference_times = []
 
         print(f"\nEvaluating {model_name}...")
@@ -90,12 +90,12 @@ class ModelEvaluator:
         return metrics
 
     def _calculate_metrics(self, targets, preds, inference_times):
-        mse  = mean_squared_error(targets.flatten(), preds.flatten())
-        mae  = mean_absolute_error(targets.flatten(), preds.flatten())
-        rmse = np.sqrt(mse)
-        psnr = np.mean([self._psnr(targets[i], preds[i]) for i in range(len(preds))])
-        ssim = self._ssim(targets, preds)
-        avg_inf   = np.mean(inference_times)
+        mse        = mean_squared_error(targets.flatten(), preds.flatten())
+        mae        = mean_absolute_error(targets.flatten(), preds.flatten())
+        rmse       = np.sqrt(mse)
+        psnr       = np.mean([self._psnr(targets[i], preds[i]) for i in range(len(preds))])
+        ssim       = self._ssim(targets, preds)
+        avg_inf    = np.mean(inference_times)
         throughput = len(preds) / np.sum(inference_times)
         return {
             'MSE': mse, 'MAE': mae, 'RMSE': rmse,
@@ -110,10 +110,10 @@ class ModelEvaluator:
 
     @staticmethod
     def _ssim(targets, preds):
-        c1, c2 = 0.01 ** 2, 0.03 ** 2
-        mu_x, mu_y   = np.mean(targets), np.mean(preds)
-        sigma_x, sigma_y = np.std(targets), np.std(preds)
-        sigma_xy     = np.mean((targets - mu_x) * (preds - mu_y))
+        c1, c2   = 0.01 ** 2, 0.03 ** 2
+        mu_x, mu_y       = np.mean(targets), np.mean(preds)
+        sigma_x, sigma_y = np.std(targets),  np.std(preds)
+        sigma_xy = np.mean((targets - mu_x) * (preds - mu_y))
         return ((2*mu_x*mu_y + c1) * (2*sigma_xy + c2)) / (
                (mu_x**2 + mu_y**2 + c1) * (sigma_x**2 + sigma_y**2 + c2))
 
@@ -142,11 +142,12 @@ class ModelEvaluator:
         return df
 
     def _plot_metrics_comparison(self, df, output_dir):
-        metrics  = [c for c in df.columns if c != 'Model']
-        colors   = ['#4e79a7', '#f28e2b', '#e15759', '#76b7b2', '#59a14f']
+        metrics = [c for c in df.columns if c != 'Model']
+        colors  = ['#4e79a7', '#f28e2b', '#e15759', '#76b7b2', '#59a14f']
 
         fig, axes = plt.subplots(len(metrics), 1, figsize=(10, 5 * len(metrics)))
-        if len(metrics) == 1: axes = [axes]
+        if len(metrics) == 1:
+            axes = [axes]
 
         for metric, ax in zip(metrics, axes):
             df[metric].plot(kind='bar', ax=ax, color=colors[:len(df)])
@@ -203,15 +204,19 @@ def main():
     print("\n### STEP 1: Loading Dataset ###")
     try:
         full_dataset = SEN12MSCRDataset(
-            root_dir=Config.DATASET_ROOT,
-            seasons=Config.SEASONS,
-            s2_bands=Config.S2_BANDS,
-            patch_size=Config.PATCH_SIZE,
-            data_fraction=Config.DATA_FRACTION,
-            min_cloud_fraction=Config.MIN_CLOUD_FRACTION,
-            max_cloud_fraction=Config.MAX_CLOUD_FRACTION,
-            cloud_mask_mode=Config.CLOUD_MASK_MODE,
-            random_seed=42,
+            root_dir            = Config.DATASET_ROOT,
+            seasons             = Config.SEASONS,
+            s2_bands            = Config.S2_BANDS,
+            patch_size          = Config.PATCH_SIZE,
+            data_fraction       = Config.DATA_FRACTION,
+            min_cloud_fraction  = Config.MIN_CLOUD_FRACTION,
+            max_cloud_fraction  = Config.MAX_CLOUD_FRACTION,
+            cloud_mask_mode     = Config.CLOUD_MASK_MODE,
+            gt_diff_weight      = Config.GT_DIFF_WEIGHT,
+            cloud_threshold     = Config.FD_CLOUD_THRESHOLD,
+            use_moist_check     = Config.FD_USE_MOIST_CHECK,
+            shadow_as_cloud     = Config.FD_SHADOW_AS_CLOUD,
+            random_seed         = 42,
         )
 
         scene_to_indices = defaultdict(list)
@@ -276,16 +281,16 @@ def main():
         try:
             trainer = ModelTrainer(
                 model_name,
-                device=device,
-                loss_type=Config.LOSS_TYPE,
+                device    = device,
+                loss_type = Config.LOSS_TYPE,
             )
             model, history = trainer.train(
-                train_loader=train_loader,
-                val_loader=val_loader,
-                epochs=Config.EPOCHS,
-                lr=Config.LEARNING_RATE,
-                patience=Config.PATIENCE,
-                use_amp=Config.USE_AMP,
+                train_loader = train_loader,
+                val_loader   = val_loader,
+                epochs       = Config.EPOCHS,
+                lr           = Config.LEARNING_RATE,
+                patience     = Config.PATIENCE,
+                use_amp      = Config.USE_AMP,
             )
             trained_models[model_name] = model
             training_times[model_name] = time.time() - start
