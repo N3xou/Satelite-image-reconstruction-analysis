@@ -116,7 +116,18 @@ def visualize_predictions(models, dataset, device, output_dir, n_samples=5):
             model.eval()
             with torch.no_grad():
                 input_tensor = model_input.unsqueeze(1) if 'LSTM' in model_name else model_input
-                pred     = model(input_tensor)
+                if 'Diffusion' in model_name:
+                    bs = input_tensor.shape[0]
+                    t = torch.zeros(bs, dtype=torch.long, device=device)
+                    n_s1 = s1.shape[0]
+                    s1_t = input_tensor[:, :n_s1]
+                    s2_cloudy_t = model_input[:, n_s1:]
+                    cm_t = cloud_mask.unsqueeze(0).to(device)
+                    x_cond = torch.cat([s1_t, cm_t], dim=1)
+                    x_input = torch.cat([s2_cloudy_t,x_cond], dim=1)
+                    pred = model(x_input, t)
+                else:
+                    pred = model(input_tensor)
                 pred_img = pred[0].detach().cpu()
 
                 if pred_img.shape[0] >= 13:

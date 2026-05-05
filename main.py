@@ -69,6 +69,12 @@ class ModelEvaluator:
 
                 if model_name == 'RandomForest':
                     output = model.predict(s1, s2_cloudy, cloud_mask, device=self.device)
+                elif model_name == 'Diffusion':
+                    bs = model_input.shape[0]
+                    t = torch.zeros(bs,dtype=torch.long,device=self.device)
+                    x_cond = torch.cat([s1, cloud_mask], dim=1)
+                    x_input = torch.cat([s2_cloudy, x_cond], dim=1)
+                    output = model(x_input, t)
                 else:
                     output = model(model_input)
 

@@ -567,10 +567,11 @@ class ModelTrainer:
             with torch.no_grad():
                 for s1, s2_cloudy, s2_clean, cloud_mask in val_loader:
                     s1 = s1.to(self.device); s2_clean = s2_clean.to(self.device); cloud_mask = cloud_mask.to(self.device)
+                    val_bs = s2_clean.shape[0]
                     x_cond  = torch.cat([s1, cloud_mask], dim=1)
                     x_noisy = torch.randn_like(s2_clean)
                     x_input = torch.cat([x_noisy, x_cond], dim=1)
-                    pred_n  = model(x_input, torch.zeros(bs, dtype=torch.long, device=self.device))
+                    pred_n  = model(x_input, torch.zeros(val_bs, dtype=torch.long, device=self.device))
                     val_loss += nn.functional.mse_loss(x_noisy - pred_n, s2_clean).item()
             train_loss /= len(train_loader); val_loss /= len(val_loader)
             print(f"Epoch {epoch+1}/{epochs}  train={train_loss:.6f}  val={val_loss:.6f}")

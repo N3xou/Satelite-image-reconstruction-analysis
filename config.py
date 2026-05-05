@@ -14,12 +14,12 @@ class Config:
     # Dataset
     # ------------------------------------------------------------------
     DATASET_ROOT       = "./sen12mscr_dataset"
-    SEASONS            = None              # None = all four seasons
+    SEASONS            = None           # None = all four seasons
     S2_BANDS           = list(range(1, 14))  # all 13 Sentinel-2 bands
     PATCH_SIZE         = 256
-    DATA_FRACTION      = 0.1             # fraction of scenes to load
+    DATA_FRACTION      = 1             # fraction of scenes to load
     MIN_CLOUD_FRACTION = 0.1              # discard patches with less cloud
-    MAX_CLOUD_FRACTION = 0.5              # discard patches with more cloud
+    MAX_CLOUD_FRACTION = 0.7              # discard patches with more cloud
 
     # Cloud mask mode fed to SEN12MSCRDataset.
     #
@@ -86,9 +86,9 @@ class Config:
     # Training
     # ------------------------------------------------------------------
     BATCH_SIZE     = 6
-    EPOCHS         = 5
+    EPOCHS         = 50
     LEARNING_RATE  = 0.001
-    PATIENCE       = 2
+    PATIENCE       = 3
     USE_AMP        = True      # Automatic Mixed Precision (mandatory on Pascal)
     NUM_WORKERS    = 4
 
@@ -96,9 +96,9 @@ class Config:
     # Models to train
     # Choices: "SimpleCNN" | "UNet" | "GAN" | "DSen2CR" | "Diffusion" | "RandomForest"
     # ------------------------------------------------------------------
-    MODELS = ["UNet"]
+    #MODELS = ["DSen2CR"]
     # MODELS = ["GAN", "UNet", "RandomForest"]
-    # MODELS = ["SimpleCNN", "UNet", "GAN", "DSen2CR", "Diffusion", "RandomForest"]
+    MODELS = ["SimpleCNN", "UNet", "GAN", "Diffusion", "RandomForest"]
 
     # ------------------------------------------------------------------
     # Output
