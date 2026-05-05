@@ -117,15 +117,36 @@ def visualize_predictions(models, dataset, device, output_dir, n_samples=5):
             with torch.no_grad():
                 input_tensor = model_input.unsqueeze(1) if 'LSTM' in model_name else model_input
                 if 'Diffusion' in model_name:
-                    bs = input_tensor.shape[0]
-                    t = torch.zeros(bs, dtype=torch.long, device=device)
-                    n_s1 = s1.shape[0]
-                    s1_t = input_tensor[:, :n_s1]
+                    bs          = model_input.shape[0]
+                    n_s1        = s1.shape[0]
+                    s1_t        = model_input[:, :n_s1]
                     s2_cloudy_t = model_input[:, n_s1:]
-                    cm_t = cloud_mask.unsqueeze(0).to(device)
-                    x_cond = torch.cat([s1_t, cm_t], dim=1)
-                    x_input = torch.cat([s2_cloudy_t,x_cond], dim=1)
-                    pred = model(x_input, t)
+                    cm_t        = cloud_mask.unsqueeze(0).to(device)
+                
+                    # Simple 10-step reverse diffusion for visualization
+                    T              = 1000
+                    betas          = torch.linspace(1e-4, 0.02, T).to(device)
+                    alphas         = 1.0 - betas
+                    alphas_cumprod = torch.cumprod(alphas, dim=0).clamp(min=1e-5)
+                
+                    x = torch.randn_like(s2_cloudy_t)  # start from pure noise
+                    x_cond = torch.cat([s1_t, s2_cloudy_t, cm_t], dim=1)
+                
+                    step_size = T // 10  # 10 denoising steps
+                    for i in reversed(range(0, T, step_size)):
+                        t_tensor = torch.full((bs,), i, dtype=torch.long, device=device)
+                        x_input  = torch.cat([x, x_cond], dim=1)
+                        with torch.no_grad():
+                            pred_noise = model(x_input, t_tensor)
+                        # DDPM reverse step
+                        alpha     = alphas[i]
+                        acp       = alphas_cumprod[i]
+                        x = (1.0 / alpha.sqrt()) * (
+                            x - (1.0 - alpha) / (1.0 - acp).sqrt() * pred_noise
+                        )
+                        if i > 0:
+                            x = x + betas[i].sqrt() * torch.randn_like(x)
+                    pred = x.clamp(0, 1)
                 else:
                     pred = model(input_tensor)
                 pred_img = pred[0].detach().cpu()
