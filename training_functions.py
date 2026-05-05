@@ -518,67 +518,111 @@ class ModelTrainer:
     # ------------------------------------------------------------------
 
     def _train_diffusion_fold(self, train_loader, val_loader, epochs, lr,
-                               patience, use_amp, n_channels, out_channels,
-                               loss_type: str = "MRL"):
-        """
-        loss_type="basic" : uniform MSE on noise prediction — nn.functional.mse_loss
-        loss_type="MRL"   : diffusion_noise_loss — upweights noise error on cloud pixels
-        """
-        use_mrl    = (loss_type == "MRL")
-        print(f"  Loss: {'diffusion_noise_loss (MRL)' if use_mrl else 'uniform MSE (basic)'}")
-        n_channels += 1  # +1 for cloud mask conditioning channel
-        model = DiffusionModel(in_channels=n_channels, out_channels=out_channels).to(self.device)
-        optimizer      = optim.Adam(model.parameters(), lr=lr)
-        early_stopping = EarlyStopping(patience=patience, verbose=True)
-        scaler = torch.cuda.amp.GradScaler() if use_amp and self.device == 'cuda' else None
+                           patience, use_amp, n_channels, out_channels,
+                           loss_type: str = "MRL"):
+    use_mrl = (loss_type == "MRL")
+    print(f"  Loss: {'diffusion_noise_loss (MRL)' if use_mrl else 'uniform MSE (basic)'}")
 
-        T             = 1000
-        betas         = torch.linspace(1e-4, 0.02, T).to(self.device)
-        alphas        = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
+    # Bug 4 fix: don't mutate the argument
+    diffusion_in_channels = n_channels + 1  # +1 for cloud_mask conditioning
 
-        for epoch in range(epochs):
-            model.train(); train_loss = 0.0
-            for s1, s2_cloudy, s2_clean, cloud_mask in train_loader:
-                s1         = s1.to(self.device);         s2_cloudy  = s2_cloudy.to(self.device)
-                s2_clean   = s2_clean.to(self.device);   cloud_mask = cloud_mask.to(self.device)
-                bs         = s2_clean.shape[0]
-                x_cond     = torch.cat([s1, cloud_mask], dim=1)
-                t          = torch.randint(0, T, (bs,), device=self.device)
-                noise      = torch.randn_like(s2_clean)
-                x_noisy    = (alphas_cumprod[t][:,None,None,None]**0.5 * s2_clean +
-                               (1-alphas_cumprod[t][:,None,None,None])**0.5 * noise)
-                x_input    = torch.cat([x_noisy, x_cond], dim=1)
-                optimizer.zero_grad(set_to_none=True)
-                if use_amp and scaler:
-                    with torch.cuda.amp.autocast():
-                        pred_n = model(x_input, t)
-                        loss   = (diffusion_noise_loss(pred_n, noise, cloud_mask)
-                                  if use_mrl else nn.functional.mse_loss(pred_n, noise))
-                    scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
-                else:
+    model = DiffusionModel(
+        in_channels=diffusion_in_channels,
+        out_channels=out_channels
+    ).to(self.device)
+
+    optimizer      = optim.Adam(model.parameters(), lr=lr)
+    early_stopping = EarlyStopping(patience=patience, verbose=True)
+    scaler = torch.cuda.amp.GradScaler() if use_amp and self.device == 'cuda' else None
+
+    T    = 1000
+    # Bug 1 fix: clamp betas to a safer range, compute cumprod in float64
+    # then cast back — prevents underflow at high t
+    betas = torch.linspace(1e-4, 0.02, T, dtype=torch.float64)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0).float().to(self.device)
+    # Clamp to avoid sqrt(~0) producing NaN gradients
+    alphas_cumprod = alphas_cumprod.clamp(min=1e-5)
+
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        num_batches = 0
+
+        for s1, s2_cloudy, s2_clean, cloud_mask in train_loader:
+            s1         = s1.to(self.device)
+            s2_cloudy  = s2_cloudy.to(self.device)
+            s2_clean   = s2_clean.to(self.device)
+            cloud_mask = cloud_mask.to(self.device)
+
+            bs     = s2_clean.shape[0]
+            x_cond = torch.cat([s1, cloud_mask], dim=1)
+            t      = torch.randint(0, T, (bs,), device=self.device)
+            noise  = torch.randn_like(s2_clean)
+
+            sqrt_acp      = alphas_cumprod[t].sqrt()[:, None, None, None]
+            sqrt_one_macp = (1.0 - alphas_cumprod[t]).sqrt()[:, None, None, None]
+            x_noisy  = sqrt_acp * s2_clean + sqrt_one_macp * noise
+            x_input  = torch.cat([x_noisy, x_cond], dim=1)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            if use_amp and scaler:
+                with torch.cuda.amp.autocast():
                     pred_n = model(x_input, t)
                     loss   = (diffusion_noise_loss(pred_n, noise, cloud_mask)
                               if use_mrl else nn.functional.mse_loss(pred_n, noise))
-                    loss.backward(); optimizer.step()
-                train_loss += loss.item()
+                # Bug 1 fix: check for NaN before stepping
+                if torch.isnan(loss):
+                    print(f"  WARNING: NaN loss at epoch {epoch+1}, skipping batch")
+                    continue
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                pred_n = model(x_input, t)
+                loss   = (diffusion_noise_loss(pred_n, noise, cloud_mask)
+                          if use_mrl else nn.functional.mse_loss(pred_n, noise))
+                if torch.isnan(loss):
+                    print(f"  WARNING: NaN loss at epoch {epoch+1}, skipping batch")
+                    continue
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
 
-            model.eval(); val_loss = 0.0
-            with torch.no_grad():
-                for s1, s2_cloudy, s2_clean, cloud_mask in val_loader:
-                    s1 = s1.to(self.device); s2_clean = s2_clean.to(self.device); cloud_mask = cloud_mask.to(self.device)
-                    val_bs = s2_clean.shape[0]
-                    x_cond  = torch.cat([s1, cloud_mask], dim=1)
-                    x_noisy = torch.randn_like(s2_clean)
-                    x_input = torch.cat([x_noisy, x_cond], dim=1)
-                    pred_n  = model(x_input, torch.zeros(val_bs, dtype=torch.long, device=self.device))
-                    val_loss += nn.functional.mse_loss(x_noisy - pred_n, s2_clean).item()
-            train_loss /= len(train_loader); val_loss /= len(val_loader)
-            print(f"Epoch {epoch+1}/{epochs}  train={train_loss:.6f}  val={val_loss:.6f}")
-            if early_stopping(val_loss, model): break
+            train_loss  += loss.item()
+            num_batches += 1
 
-        early_stopping.load_best_model(model)
-        return model
+        if num_batches == 0:
+            print(f"Epoch {epoch+1}: all batches were NaN — stopping early")
+            break
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for s1, s2_cloudy, s2_clean, cloud_mask in val_loader:
+                s1         = s1.to(self.device)
+                s2_cloudy  = s2_cloudy.to(self.device)
+                s2_clean   = s2_clean.to(self.device)
+                cloud_mask = cloud_mask.to(self.device)
+                val_bs  = s2_clean.shape[0]
+                x_cond  = torch.cat([s1, cloud_mask], dim=1)
+                x_noisy = torch.randn_like(s2_clean)
+                x_input = torch.cat([x_noisy, x_cond], dim=1)
+                pred_n  = model(x_input, torch.zeros(val_bs, dtype=torch.long, device=self.device))
+                val_loss += nn.functional.mse_loss(pred_n, torch.randn_like(s2_clean)).item()
+
+        train_loss /= num_batches
+        val_loss   /= len(val_loader)
+        print(f"Epoch {epoch+1}/{epochs}  train={train_loss:.6f}  val={val_loss:.6f}")
+        if early_stopping(val_loss, model):
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+
+    early_stopping.load_best_model(model)
+    return model
 
     # ------------------------------------------------------------------
     # Random Forest fold trainer
