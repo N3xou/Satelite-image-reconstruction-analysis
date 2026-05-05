@@ -70,11 +70,28 @@ class ModelEvaluator:
                 if model_name == 'RandomForest':
                     output = model.predict(s1, s2_cloudy, cloud_mask, device=self.device)
                 elif model_name == 'Diffusion':
-                    bs = model_input.shape[0]
-                    t = torch.zeros(bs,dtype=torch.long,device=self.device)
-                    x_cond = torch.cat([s1, cloud_mask], dim=1)
-                    x_input = torch.cat([s2_cloudy, x_cond], dim=1)
-                    output = model(x_input, t)
+                    T              = 1000
+                    betas          = torch.linspace(1e-4, 0.02, T).to(self.device)
+                    alphas         = 1.0 - betas
+                    alphas_cumprod = torch.cumprod(alphas, dim=0).clamp(min=1e-5)
+                
+                    x_cond = torch.cat([s1, s2_cloudy, cloud_mask], dim=1)  # [B, 2+13+1=16, H, W]
+                    x      = torch.randn_like(s2_cloudy)                     # [B, 13, H, W]
+                
+                    step_size = T // 10
+                    for i in reversed(range(0, T, step_size)):
+                        t_tensor   = torch.full((s2_cloudy.shape[0],), i,
+                                                dtype=torch.long, device=self.device)
+                        x_input    = torch.cat([x, x_cond], dim=1)          # [B, 29, H, W]
+                        pred_noise = model(x_input, t_tensor)
+                        alpha      = alphas[i]
+                        acp        = alphas_cumprod[i]
+                        x = (1.0 / alpha.sqrt()) * (
+                            x - (1.0 - alpha) / (1.0 - acp).sqrt() * pred_noise
+                        )
+                        if i > 0:
+                            x = x + betas[i].sqrt() * torch.randn_like(x)
+                    output = x.clamp(0, 1)
                 else:
                     output = model(model_input)
 
