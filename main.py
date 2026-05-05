@@ -215,6 +215,90 @@ class ModelEvaluator:
 
 
 # ==================== MAIN EXECUTION ====================
+def run_pipeline(models_override, output_dir_override, train_loader, val_loader,
+                 train_dataset, val_dataset, full_dataset, device):
+    """Run training, evaluation, visualization and saving for a given model list."""
+    output_dir_override.mkdir(exist_ok=True, parents=True)
+
+    # ── STEP 2: Train Models ──────────────────────────────────────────
+    print(f"\n### TRAINING: {models_override} → {output_dir_override} ###")
+    trained_models = {}
+    training_times = {}
+
+    for model_name in models_override:
+        print(f"\n{'='*70}")
+        print(f"Training {model_name}  [loss={Config.LOSS_TYPE}]")
+        print(f"{'='*70}")
+        start = time.time()
+        try:
+            trainer = ModelTrainer(
+                model_name,
+                device    = device,
+                loss_type = Config.LOSS_TYPE,
+            )
+            model, history = trainer.train(
+                train_loader = train_loader,
+                val_loader   = val_loader,
+                epochs       = Config.EPOCHS,
+                lr           = Config.LEARNING_RATE,
+                patience     = Config.PATIENCE,
+                use_amp      = Config.USE_AMP,
+            )
+            trained_models[model_name] = model
+            training_times[model_name] = time.time() - start
+            print(f"\n✓ {model_name} done: {training_times[model_name]/60:.2f} min")
+        except Exception as e:
+            print(f"\n✗ Error training {model_name}: {e}")
+            import traceback; traceback.print_exc()
+
+    if not trained_models:
+        print("\n✗ No models trained successfully.")
+        return
+
+    # ── STEP 3: Evaluate ─────────────────────────────────────────────
+    print("\n### STEP 3: Evaluating Models ###")
+    evaluator = ModelEvaluator(device=device)
+    for model_name, model in trained_models.items():
+        try:
+            evaluator.evaluate_model(model, val_loader, model_name)
+        except Exception as e:
+            print(f"\n✗ Evaluation error for {model_name}: {e}")
+
+    # ── STEP 4: Reports ───────────────────────────────────────────────
+    print("\n### STEP 4: Generating Reports ###")
+    comparison_df = evaluator.generate_comparison_report(training_times, output_dir_override)
+    if comparison_df is None:
+        print("\n✗ No results to report.")
+        return
+
+    # ── STEP 5: Visualise ─────────────────────────────────────────────
+    print("\n### STEP 5: Visualising Predictions ###")
+    visualize_predictions(trained_models, val_dataset, device, output_dir_override, n_samples=5)
+
+    # ── STEP 6: Save Models ───────────────────────────────────────────
+    if Config.SAVE_MODELS:
+        print("\n### STEP 6: Saving Models ###")
+        model_dir = output_dir_override / 'saved_models'
+        model_dir.mkdir(exist_ok=True)
+        for model_name, model in trained_models.items():
+            path = model_dir / f'{model_name}.pth'
+            torch.save(model.state_dict(), path)
+            print(f"✓ Saved {model_name}: {path}")
+
+    # ── Summary ───────────────────────────────────────────────────────
+    print("\n" + "=" * 70)
+    print(f"PIPELINE COMPLETE — {output_dir_override}")
+    print("=" * 70)
+    print(f"Loss type used: {Config.LOSS_TYPE}")
+    for model_name, t in training_times.items():
+        try:
+            psnr = comparison_df.loc[model_name, 'PSNR_dB']
+            thr  = comparison_df.loc[model_name, 'Throughput_img_s']
+            print(f"  {model_name:.<15} {t/60:>6.2f} min  │  {psnr:>6.2f} dB  │  {thr:>6.2f} img/s")
+        except KeyError:
+            print(f"  {model_name:.<15} {t/60:>6.2f} min  │  metrics missing")
+    print("=" * 70)
+
 
 def main():
     # Validate and print config
@@ -223,7 +307,7 @@ def main():
 
     Config.OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-    # ── STEP 1: Load Dataset ──────────────────────────────────────────
+    # ── STEP 1: Load Dataset (shared across both pipelines) ───────────
     print("\n### STEP 1: Loading Dataset ###")
     try:
         full_dataset = SEN12MSCRDataset(
@@ -286,89 +370,37 @@ def main():
 
     visualize_dataset_samples(full_dataset, Config.OUTPUT_DIR, n_samples=3)
 
-    # ── STEP 2: Train Models ──────────────────────────────────────────
-    print("\n### STEP 2: Training Models ###")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}")
+    print(f"\nDevice: {device}")
     if device == 'cuda':
         print(f"GPU:    {torch.cuda.get_device_name(0)}")
 
-    trained_models = {}
-    training_times = {}
+    # ── Pipeline 1: Config models ─────────────────────────────────────
+    run_pipeline(
+        models_override  = Config.MODELS,
+        output_dir_override = Config.OUTPUT_DIR,
+        train_loader     = train_loader,
+        val_loader       = val_loader,
+        train_dataset    = train_dataset,
+        val_dataset      = val_dataset,
+        full_dataset     = full_dataset,
+        device           = device,
+    )
 
-    for model_name in Config.MODELS:
-        print(f"\n{'='*70}")
-        print(f"Training {model_name}  [loss={Config.LOSS_TYPE}]")
-        print(f"{'='*70}")
-        start = time.time()
-        try:
-            trainer = ModelTrainer(
-                model_name,
-                device    = device,
-                loss_type = Config.LOSS_TYPE,
-            )
-            model, history = trainer.train(
-                train_loader = train_loader,
-                val_loader   = val_loader,
-                epochs       = Config.EPOCHS,
-                lr           = Config.LEARNING_RATE,
-                patience     = Config.PATIENCE,
-                use_amp      = Config.USE_AMP,
-            )
-            trained_models[model_name] = model
-            training_times[model_name] = time.time() - start
-            print(f"\n✓ {model_name} done: {training_times[model_name]/60:.2f} min")
-        except Exception as e:
-            print(f"\n✗ Error training {model_name}: {e}")
-            import traceback; traceback.print_exc()
-
-    if not trained_models:
-        print("\n✗ No models trained successfully.")
-        return
-
-    # ── STEP 3: Evaluate ─────────────────────────────────────────────
-    print("\n### STEP 3: Evaluating Models ###")
-    evaluator = ModelEvaluator(device=device)
-    for model_name, model in trained_models.items():
-        try:
-            evaluator.evaluate_model(model, val_loader, model_name)
-        except Exception as e:
-            print(f"\n✗ Evaluation error for {model_name}: {e}")
-
-    # ── STEP 4: Reports ───────────────────────────────────────────────
-    print("\n### STEP 4: Generating Reports ###")
-    comparison_df = evaluator.generate_comparison_report(training_times, Config.OUTPUT_DIR)
-    if comparison_df is None:
-        print("\n✗ No results to report.")
-        return
-
-    # ── STEP 5: Visualise ─────────────────────────────────────────────
-    print("\n### STEP 5: Visualising Predictions ###")
-    visualize_predictions(trained_models, val_dataset, device, Config.OUTPUT_DIR, n_samples=5)
-
-    # ── STEP 6: Save Models ───────────────────────────────────────────
-    if Config.SAVE_MODELS:
-        print("\n### STEP 6: Saving Models ###")
-        model_dir = Config.OUTPUT_DIR / 'saved_models'
-        model_dir.mkdir(exist_ok=True)
-        for model_name, model in trained_models.items():
-            path = model_dir / f'{model_name}.pth'
-            torch.save(model.state_dict(), path)
-            print(f"✓ Saved {model_name}: {path}")
-
-    # ── Summary ───────────────────────────────────────────────────────
+    # ── Pipeline 2: DSen2CR only ──────────────────────────────────────
     print("\n" + "=" * 70)
-    print("PIPELINE COMPLETE")
+    print("STARTING DSen2CR STANDALONE PIPELINE")
     print("=" * 70)
-    print(f"Loss type used: {Config.LOSS_TYPE}")
-    for model_name, t in training_times.items():
-        try:
-            psnr = comparison_df.loc[model_name, 'PSNR_dB']
-            thr  = comparison_df.loc[model_name, 'Throughput_img_s']
-            print(f"  {model_name:.<15} {t/60:>6.2f} min  │  {psnr:>6.2f} dB  │  {thr:>6.2f} img/s")
-        except KeyError:
-            print(f"  {model_name:.<15} {t/60:>6.2f} min  │  metrics missing")
-    print("=" * 70)
+    run_pipeline(
+        models_override     = ["DSen2CR"],
+        output_dir_override = Path(str(Config.OUTPUT_DIR) + '_dsen2cr'),
+        train_loader        = train_loader,
+        val_loader          = val_loader,
+        train_dataset       = train_dataset,
+        val_dataset         = val_dataset,
+        full_dataset        = full_dataset,
+        device              = device,
+    )
 
 
 if __name__ == '__main__':
