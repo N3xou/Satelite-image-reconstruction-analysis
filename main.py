@@ -22,7 +22,7 @@ from config import Config
 from config2 import Config2
 from config3 import Config3
 from config4 import Config4
-from data_loader import SEN12MSCRDataset
+from data_loader import SEN12MSCRDataset, create_dataset, SyntheticDataset
 from training_functions import ModelTrainer
 from Visualization import visualize_dataset_samples, visualize_predictions
 
@@ -77,15 +77,15 @@ class ModelEvaluator:
                     betas          = torch.linspace(1e-4, 0.02, T).to(self.device)
                     alphas         = 1.0 - betas
                     alphas_cumprod = torch.cumprod(alphas, dim=0).clamp(min=1e-5)
-                
-                    x_cond = torch.cat([s1, s2_cloudy, cloud_mask], dim=1)  # [B, 2+13+1=16, H, W]
-                    x      = torch.randn_like(s2_cloudy)                     # [B, 13, H, W]
-                
+
+                    x_cond = torch.cat([s1, s2_cloudy, cloud_mask], dim=1)
+                    x      = torch.randn_like(s2_cloudy)
+
                     step_size = T // 10
                     for i in reversed(range(0, T, step_size)):
                         t_tensor   = torch.full((s2_cloudy.shape[0],), i,
                                                 dtype=torch.long, device=self.device)
-                        x_input    = torch.cat([x, x_cond], dim=1)          # [B, 29, H, W]
+                        x_input    = torch.cat([x, x_cond], dim=1)
                         pred_noise = model(x_input, t_tensor)
                         alpha      = alphas[i]
                         acp        = alphas_cumprod[i]
@@ -303,6 +303,43 @@ def run_pipeline(models_override, output_dir_override, train_loader, val_loader,
     print("=" * 70)
 
 
+def _split_dataset(full_dataset):
+    """
+    Scene-aware 80/20 train/val split for SEN12MSCRDataset.
+    Falls back to index-based split for SyntheticDataset.
+    """
+    if isinstance(full_dataset, SyntheticDataset):
+        indices            = list(range(len(full_dataset)))
+        train_idx, val_idx = train_test_split(indices, test_size=0.2, random_state=42)
+        print(f"  Train samples: {len(train_idx)}  |  Val samples: {len(val_idx)}")
+        return (
+            torch.utils.data.Subset(full_dataset, train_idx),
+            torch.utils.data.Subset(full_dataset, val_idx),
+        )
+
+    # Scene-aware split for SEN12MSCRDataset
+    scene_to_indices = defaultdict(list)
+    for idx, sample in enumerate(full_dataset.samples):
+        parts    = sample['s2_clean'].parts
+        season   = parts[-3].split('_s2')[0]
+        scene_id = parts[-2].split('_')[1]
+        scene_to_indices[f"{season}_{scene_id}"].append(idx)
+
+    scene_keys               = list(scene_to_indices.keys())
+    train_scenes, val_scenes = train_test_split(scene_keys, test_size=0.2, random_state=42)
+    train_indices            = [i for s in train_scenes for i in scene_to_indices[s]]
+    val_indices              = [i for s in val_scenes   for i in scene_to_indices[s]]
+
+    print(f"  Total scenes: {len(scene_keys)}  |  "
+          f"Train scenes: {len(train_scenes)} ({len(train_indices)} samples)  |  "
+          f"Val scenes: {len(val_scenes)} ({len(val_indices)} samples)")
+
+    return (
+        torch.utils.data.Subset(full_dataset, train_indices),
+        torch.utils.data.Subset(full_dataset, val_indices),
+    )
+
+
 def main():
     # Validate and print config
     Config.validate()
@@ -310,46 +347,11 @@ def main():
 
     Config.OUTPUT_DIR.mkdir(exist_ok=True, parents=True)
 
-    # ── STEP 1: Load Dataset (shared across both pipelines) ───────────
+    # ── STEP 1: Load Dataset (shared across all pipelines) ────────────
     print("\n### STEP 1: Loading Dataset ###")
     try:
-        full_dataset = SEN12MSCRDataset(
-            root_dir            = Config.DATASET_ROOT,
-            seasons             = Config.SEASONS,
-            s2_bands            = Config.S2_BANDS,
-            patch_size          = Config.PATCH_SIZE,
-            data_fraction       = Config.DATA_FRACTION,
-            min_cloud_fraction  = Config.MIN_CLOUD_FRACTION,
-            max_cloud_fraction  = Config.MAX_CLOUD_FRACTION,
-            cloud_mask_mode     = Config.CLOUD_MASK_MODE,
-            gt_diff_weight      = Config.GT_DIFF_WEIGHT,
-            cloud_threshold     = Config.FD_CLOUD_THRESHOLD,
-            use_moist_check     = Config.FD_USE_MOIST_CHECK,
-            shadow_as_cloud     = Config.FD_SHADOW_AS_CLOUD,
-            random_seed         = 42,
-        )
-
-        scene_to_indices = defaultdict(list)
-        for idx, sample in enumerate(full_dataset.samples):
-            parts    = sample['s2_clean'].parts
-            season   = parts[-3].split('_s2')[0]
-            scene_id = parts[-2].split('_')[1]
-            scene_to_indices[f"{season}_{scene_id}"].append(idx)
-
-        scene_keys = list(scene_to_indices.keys())
-        train_scenes, val_scenes = train_test_split(
-            scene_keys, test_size=0.2, random_state=42)
-
-        train_indices = [i for s in train_scenes for i in scene_to_indices[s]]
-        val_indices   = [i for s in val_scenes   for i in scene_to_indices[s]]
-
-        train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
-        val_dataset   = torch.utils.data.Subset(full_dataset, val_indices)
-
-        print(f"\n✓ Dataset loaded")
-        print(f"  Total scenes:      {len(scene_keys)}")
-        print(f"  Train scenes:      {len(train_scenes)}  ({len(train_dataset)} samples)")
-        print(f"  Val scenes:        {len(val_scenes)}  ({len(val_dataset)} samples)")
+        full_dataset = create_dataset(Config)
+        train_dataset, val_dataset = _split_dataset(full_dataset)
 
     except Exception as e:
         print(f"\n✗ Error loading dataset: {e}")
@@ -380,45 +382,46 @@ def main():
 
     # ── Pipeline 1: Config models ─────────────────────────────────────
     run_pipeline(
-        models_override  = Config.MODELS,
+        models_override     = Config.MODELS,
         output_dir_override = Config.OUTPUT_DIR,
-        train_loader     = train_loader,
-        val_loader       = val_loader,
-        train_dataset    = train_dataset,
-        val_dataset      = val_dataset,
-        full_dataset     = full_dataset,
-        device           = device,
+        train_loader        = train_loader,
+        val_loader          = val_loader,
+        train_dataset       = train_dataset,
+        val_dataset         = val_dataset,
+        full_dataset        = full_dataset,
+        device              = device,
     )
     run_pipeline(
-        models_override=Config.MODELS,
-        output_dir_override=Config2.OUTPUT_DIR,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        full_dataset=full_dataset,
-        device=device,
+        models_override     = Config.MODELS,
+        output_dir_override = Config2.OUTPUT_DIR,
+        train_loader        = train_loader,
+        val_loader          = val_loader,
+        train_dataset       = train_dataset,
+        val_dataset         = val_dataset,
+        full_dataset        = full_dataset,
+        device              = device,
     )
     run_pipeline(
-        models_override=Config.MODELS,
-        output_dir_override=Config3.OUTPUT_DIR,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        full_dataset=full_dataset,
-        device=device,
+        models_override     = Config.MODELS,
+        output_dir_override = Config3.OUTPUT_DIR,
+        train_loader        = train_loader,
+        val_loader          = val_loader,
+        train_dataset       = train_dataset,
+        val_dataset         = val_dataset,
+        full_dataset        = full_dataset,
+        device              = device,
     )
     run_pipeline(
-        models_override=Config.MODELS,
-        output_dir_override=Config4.OUTPUT_DIR,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        train_dataset=train_dataset,
-        val_dataset=val_dataset,
-        full_dataset=full_dataset,
-        device=device,
+        models_override     = Config.MODELS,
+        output_dir_override = Config4.OUTPUT_DIR,
+        train_loader        = train_loader,
+        val_loader          = val_loader,
+        train_dataset       = train_dataset,
+        val_dataset         = val_dataset,
+        full_dataset        = full_dataset,
+        device              = device,
     )
+
     # ── Pipeline 2: DSen2CR only ──────────────────────────────────────
     print("\n" + "=" * 70)
     print("STARTING DSen2CR STANDALONE PIPELINE")
