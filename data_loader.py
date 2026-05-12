@@ -18,6 +18,7 @@ import warnings
 from tqdm import tqdm
 warnings.filterwarnings('ignore')
 
+
 try:
     import scipy
     import scipy.signal as scisig
@@ -1270,3 +1271,132 @@ if __name__ == '__main__':
         split_interface()
     else:
         print("Exiting...")
+
+class SyntheticDataset(Dataset):
+    """
+    PyTorch Dataset over synthetic .npy image pairs produced by
+    SatelliteDatasetPreparer.create_synthetic_dataset().
+ 
+    Directory layout expected (matches what the generator writes):
+        <data_dir>/
+            clean/   img_0000.npy  … img_N.npy   shape (n_bands, H, W)
+            cloudy/  img_0000.npy  … img_N.npy   shape (n_bands, H, W)
+ 
+    Each item returns the same four-tuple as SEN12MSCRDataset:
+        s1         : Tensor (2, H, W)   — zeroed (no real SAR for synthetic)
+        s2_cloudy  : Tensor (C, H, W)
+        s2_clean   : Tensor (C, H, W)
+        cloud_mask : Tensor (1, H, W)   — |cloudy - clean| soft mask
+ 
+    The zero-SAR convention is consistent with inference.py's fallback when
+    no S1 image is supplied, so models trained on synthetic data can be
+    evaluated with or without real SAR at inference time.
+    """
+ 
+    def __init__(self, data_dir: str):
+        self.clean_dir  = Path(data_dir) / "clean"
+        self.cloudy_dir = Path(data_dir) / "cloudy"
+ 
+        self.files = sorted(self.clean_dir.glob("*.npy"))
+        if not self.files:
+            raise FileNotFoundError(
+                f"No .npy files found in {self.clean_dir}. "
+                f"Run SatelliteDatasetPreparer.create_synthetic_dataset() first."
+            )
+ 
+        # Infer band count from the first file so downstream code can read it
+        sample        = np.load(self.files[0])      # (C, H, W)
+        self.s2_bands = list(range(1, sample.shape[0] + 1))
+ 
+        print(
+            f"[SyntheticDataset] {len(self.files)} pairs | "
+            f"{sample.shape[0]} bands | {sample.shape[1]}×{sample.shape[2]} px"
+        )
+ 
+    def __len__(self):
+        return len(self.files)
+ 
+    def __getitem__(self, idx):
+        fname      = self.files[idx].name
+        s2_clean   = np.load(self.clean_dir  / fname).astype(np.float32)
+        s2_cloudy  = np.load(self.cloudy_dir / fname).astype(np.float32)
+ 
+        C, H, W = s2_clean.shape
+ 
+        # Dummy SAR (zeros) — synthetic data has no real SAR counterpart
+        s1 = np.zeros((2, H, W), dtype=np.float32)
+ 
+        # Ground-truth difference cloud mask (same logic as CloudMaskComputer._gt_diff)
+        diff       = np.abs(s2_cloudy - s2_clean).mean(axis=0)   # (H, W)
+        cloud_mask = np.clip(diff / 0.30, 0.0, 1.0)[None]        # (1, H, W)
+ 
+        return (
+            torch.from_numpy(s1),
+            torch.from_numpy(s2_cloudy),
+            torch.from_numpy(s2_clean),
+            torch.from_numpy(cloud_mask),
+        )
+ 
+ 
+# ── Factory function — paste after SyntheticDataset ──────────────────────────
+ 
+def create_dataset(config) -> Dataset:
+    """
+    Return the correct Dataset based on Config.USE_SYNTHETIC.
+ 
+    Parameters
+    ----------
+    config : Config class (not an instance — pass the class itself)
+ 
+    Returns
+    -------
+    Dataset  — either SEN12MSCRDataset or SyntheticDataset, both yielding
+               (s1, s2_cloudy, s2_clean, cloud_mask) four-tuples.
+ 
+    Usage in main.py
+    ----------------
+        from data_loader import create_dataset
+        full_dataset = create_dataset(Config)
+    """
+    if config.USE_SYNTHETIC:
+        from synthetic_data_generator import SatelliteDatasetPreparer
+ 
+        preparer = SatelliteDatasetPreparer(data_dir=config.SYNTHETIC_DATA_DIR)
+        clean_dir = Path(config.SYNTHETIC_DATA_DIR) / "clean"
+ 
+        # Only regenerate if the directory is empty or missing
+        if not clean_dir.exists() or not any(clean_dir.glob("*.npy")):
+            print(
+                f"[create_dataset] Generating {config.SYNTHETIC_N_SAMPLES} synthetic pairs "
+                f"({config.SYNTHETIC_N_BANDS} bands, "
+                f"{config.SYNTHETIC_IMG_SIZE[0]}×{config.SYNTHETIC_IMG_SIZE[1]} px, "
+                f"cloud_density={config.SYNTHETIC_CLOUD_DENSITY:.0%}) …"
+            )
+            preparer.create_synthetic_dataset(
+                n_samples     = config.SYNTHETIC_N_SAMPLES,
+                img_size      = config.SYNTHETIC_IMG_SIZE,
+                n_bands       = config.SYNTHETIC_N_BANDS,
+            )
+        else:
+            n = len(list(clean_dir.glob("*.npy")))
+            print(f"[create_dataset] Found {n} existing synthetic pairs — skipping generation.")
+ 
+        return SyntheticDataset(data_dir=config.SYNTHETIC_DATA_DIR)
+ 
+    else:
+        return SEN12MSCRDataset(
+            root_dir            = config.DATASET_ROOT,
+            seasons             = config.SEASONS,
+            s2_bands            = config.S2_BANDS,
+            patch_size          = config.PATCH_SIZE,
+            data_fraction       = config.DATA_FRACTION,
+            min_cloud_fraction  = config.MIN_CLOUD_FRACTION,
+            max_cloud_fraction  = config.MAX_CLOUD_FRACTION,
+            cloud_mask_mode     = config.CLOUD_MASK_MODE,
+            gt_diff_weight      = config.GT_DIFF_WEIGHT,
+            cloud_threshold     = config.FD_CLOUD_THRESHOLD,
+            use_moist_check     = config.FD_USE_MOIST_CHECK,
+            shadow_as_cloud     = config.FD_SHADOW_AS_CLOUD,
+            random_seed         = 42,
+        )
+ 
