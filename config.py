@@ -21,6 +21,24 @@ class Config:
     MIN_CLOUD_FRACTION = 0.1              # discard patches with less cloud
     MAX_CLOUD_FRACTION = 0.7              # discard patches with more cloud
 
+    USE_SYNTHETIC           = False
+ 
+    # How many synthetic image pairs to generate.
+    SYNTHETIC_N_SAMPLES     = 200
+ 
+    # Spatial size of each synthetic patch (height × width).
+    SYNTHETIC_IMG_SIZE      = (256, 256)
+ 
+    # Number of spectral bands to simulate (4 = RGB+NIR, 13 = full S2).
+    # Must be consistent with models; the pipeline derives
+    # in_channels = 2 + SYNTHETIC_N_BANDS and out_channels = SYNTHETIC_N_BANDS.
+    SYNTHETIC_N_BANDS       = 4
+ 
+    # Cloud density passed to the cloud simulator (fraction of pixels).
+    SYNTHETIC_CLOUD_DENSITY = 0.3
+ 
+    # Root directory where synthetic .npy files will be written.
+    SYNTHETIC_DATA_DIR      = "./synthetic_data"
     # Cloud mask mode fed to SEN12MSCRDataset.
     #
     # "gt_diff"          — supervised soft mask from |cloudy - clean|.
