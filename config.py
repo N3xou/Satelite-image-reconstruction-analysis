@@ -17,7 +17,7 @@ class Config:
     SEASONS            = None           # None = all four seasons
     S2_BANDS           = list(range(1, 14))  # all 13 Sentinel-2 bands
     PATCH_SIZE         = 256
-    DATA_FRACTION      = 1             # fraction of scenes to load
+    DATA_FRACTION      = 1            # fraction of scenes to load
     MIN_CLOUD_FRACTION = 0.1              # discard patches with less cloud
     MAX_CLOUD_FRACTION = 0.7              # discard patches with more cloud
 
@@ -96,14 +96,14 @@ class Config:
     # Models to train
     # Choices: "SimpleCNN" | "UNet" | "GAN" | "DSen2CR" | "Diffusion" | "RandomForest"
     # ------------------------------------------------------------------
-    #MODELS = ["DSen2CR"]
+    # MODELS = ["DSen2CR"]
     # MODELS = ["GAN", "UNet", "RandomForest"]
-    MODELS = ["SimpleCNN", "UNet", "GAN", "Diffusion", "RandomForest"]
+    MODELS = ["SimpleCNN", "UNet", "GAN", "RandomForest"]
 
     # ------------------------------------------------------------------
     # Output
     # ------------------------------------------------------------------
-    OUTPUT_DIR   = Path("./MRLresults2")
+    OUTPUT_DIR   = Path("./results_fulldataDefault")
     SAVE_MODELS  = True
 
     # ------------------------------------------------------------------

@@ -19,6 +19,9 @@ import warnings
 import time
 
 from config import Config
+from config2 import Config2
+from config3 import Config3
+from config4 import Config4
 from data_loader import SEN12MSCRDataset
 from training_functions import ModelTrainer
 from Visualization import visualize_dataset_samples, visualize_predictions
@@ -386,7 +389,36 @@ def main():
         full_dataset     = full_dataset,
         device           = device,
     )
-
+    run_pipeline(
+        models_override=Config.MODELS,
+        output_dir_override=Config2.OUTPUT_DIR,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        full_dataset=full_dataset,
+        device=device,
+    )
+    run_pipeline(
+        models_override=Config.MODELS,
+        output_dir_override=Config3.OUTPUT_DIR,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        full_dataset=full_dataset,
+        device=device,
+    )
+    run_pipeline(
+        models_override=Config.MODELS,
+        output_dir_override=Config4.OUTPUT_DIR,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        full_dataset=full_dataset,
+        device=device,
+    )
     # ── Pipeline 2: DSen2CR only ──────────────────────────────────────
     print("\n" + "=" * 70)
     print("STARTING DSen2CR STANDALONE PIPELINE")
